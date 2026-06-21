@@ -9,10 +9,16 @@ import { Proxy } from "http-mitm-proxy";
 import { generateServerCert, type ServerCert } from "../ca/serverCert";
 import { logger } from "../logger";
 import { logRequest, setResponseStatus } from "./requestLog";
+import { recordTokens } from "./tokenCounter";
 import { getAccessToken } from "./token";
+import { resolveMachineId } from "../session/manager";
 
 // Per-request log id stored on ctx so onResponse can update it
 const CTX_LOG_ID = Symbol("logId");
+// machineId resolved from CONNECT auth, stored per-request
+const CTX_MACHINE_ID = Symbol("machineId");
+// socket → machineId (populated during CONNECT, reused for all requests on that tunnel)
+const socketMachineId = new WeakMap<object, string>();
 
 // Domains the proxy intercepts and forwards to Anthropic with injected token
 const INTERCEPT_DOMAINS = new Set([
@@ -76,6 +82,7 @@ export async function createMitmProxy(
   lanIp: string | null = null,
   checkAuth: (authHeader: string) => boolean = () => false,
   publicHostname: string = "bore.pub",
+  getSession: (() => import("../session/manager").Session | null) | null = null,
 ): Promise<MitmProxy> {
   const sslCaDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "claude-share-mitm-"),
@@ -155,6 +162,13 @@ export async function createMitmProxy(
 
       ctx[CTX_LOG_ID] = logRequest(method, hostname, reqPath, "allowed");
 
+      // Resolve machineId from the socket (set during CONNECT)
+      const reqSocket = ctx.clientToProxyRequest?.socket;
+      if (reqSocket) {
+        const mid = socketMachineId.get(reqSocket);
+        if (mid) ctx[CTX_MACHINE_ID] = mid;
+      }
+
       ctx.proxyToServerRequestOptions.headers =
         ctx.proxyToServerRequestOptions.headers ?? {};
       ctx.proxyToServerRequestOptions.headers["authorization"] =
@@ -218,6 +232,41 @@ export async function createMitmProxy(
         delete respHeaders["anthropic-organization-id"];
       }
 
+      // Sniff token usage from /v1/messages responses
+      const machineId: string | undefined = ctx[CTX_MACHINE_ID];
+      const reqPath = ctx.clientToProxyRequest?.url ?? "";
+      const isMessages =
+        machineId &&
+        status === 200 &&
+        (ctx.clientToProxyRequest?.headers?.host ?? "").split(":")[0] === "api.anthropic.com" &&
+        reqPath.startsWith("/v1/messages");
+
+      if (isMessages) {
+        const chunks: Buffer[] = [];
+        ctx.addResponseFilter(
+          new Transform({
+            transform(chunk, _enc, done) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              this.push(chunk);
+              done();
+            },
+            flush(done) {
+              const body = Buffer.concat(chunks).toString("utf8");
+              // Works for both streaming SSE and non-streaming JSON:
+              // - SSE: input_tokens in message_start, output_tokens in message_delta
+              // - JSON: both in top-level usage object
+              const inp = parseInt(body.match(/"input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
+              const out = parseInt(body.match(/"output_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
+              const cache = parseInt(body.match(/"cache_read_input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
+              if (inp > 0 || out > 0) {
+                recordTokens(machineId!, inp, out, cache);
+              }
+              done();
+            },
+          }),
+        );
+      }
+
       callback();
     });
 
@@ -233,6 +282,13 @@ export async function createMitmProxy(
           );
           socket.destroy();
           return;
+        }
+
+        // Resolve and store machineId for this tunnel
+        const session = getSession?.();
+        if (session) {
+          const mid = resolveMachineId(session, connectAuth);
+          if (mid) socketMachineId.set(socket, mid);
         }
 
         const [hostname, portStr] = ((req.url as string) ?? "").split(":");

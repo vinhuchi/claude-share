@@ -130,6 +130,15 @@ export function checkMachineAuth(session: Session, authHeader: string): boolean 
   return false;
 }
 
+/** Returns the machineId for a given Proxy-Authorization header, or null if not found. */
+export function resolveMachineId(session: Session, authHeader: string): string | null {
+  for (const machine of session.machines.values()) {
+    const expected = "Basic " + Buffer.from(`${machine.id}:${machine.proxyPass}`).toString("base64");
+    if (authHeader === expected) return machine.id;
+  }
+  return null;
+}
+
 export function addMachineSession(session: Session, machineId: string): MachineSession | null {
   const machine = session.machines.get(machineId);
   if (!machine) return null;

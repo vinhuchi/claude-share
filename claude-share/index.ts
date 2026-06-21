@@ -248,6 +248,7 @@ async function main() {
       return session ? checkMachineAuth(session, auth) : false;
     },
     boreServer,
+    getSession,
   );
   logger.info("MITM proxy ready");
 

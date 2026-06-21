@@ -20,7 +20,7 @@ import { pairFlow } from "./flows/pair";
 import { reconnectFlow } from "./flows/reconnect";
 import { listFlow } from "./flows/list";
 import { resolveActiveUrl } from "./health";
-import { launchClaude } from "./launch";
+import { launchClaude, launchClaudeReal } from "./launch";
 import { logger } from "./logger";
 import { parseConnectUrl } from "./pairing";
 import {
@@ -55,6 +55,7 @@ const ownIdxs = new Set<number>();
 args.forEach((a, i) => {
   if (a === "--list" || a === "-l") ownIdxs.add(i);
   if (a === "--cleanup") ownIdxs.add(i);
+  if (a === "--real") ownIdxs.add(i);
   if (a === "--reconnect" || a === "-r") {
     ownIdxs.add(i);
     if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
@@ -94,6 +95,8 @@ if (!hasAgreedToTerms()) {
 
 if (args[0] === "--list" || args[0] === "-l") {
   await listFlow();
+} else if (args.includes("--real")) {
+  await launchClaudeReal(claudeArgs, dirArg);
 } else if (args[0] === "--reconnect" || args[0] === "-r") {
   await reconnectFlow(args[1], claudeArgs, dirArg);
 } else if (shareArg) {
@@ -158,13 +161,18 @@ if (args[0] === "--list" || args[0] === "-l") {
     if (active.length > 0) {
       p.intro("claude-connect");
       const pick = await p.select({
-        message: "Connect to an active sharer or pair with a new one:",
+        message: "Launch Claude with:",
         options: [
           ...active.map((r) => ({
             value: r.conn.id,
-            label: r.conn.systemName,
+            label: `${r.conn.systemName}'s share`,
             hint: r.url,
           })),
+          {
+            value: "__real__",
+            label: "My own account",
+            hint: "use your own Claude subscription, no proxy",
+          },
           {
             value: "__new__",
             label: "Pair with a new sharer…",
@@ -176,7 +184,9 @@ if (args[0] === "--list" || args[0] === "-l") {
         p.cancel("Cancelled.");
         process.exit(0);
       }
-      if (pick === "__new__") {
+      if (pick === "__real__") {
+        await launchClaudeReal(claudeArgs, dirArg);
+      } else if (pick === "__new__") {
         await pairFlow(undefined, claudeArgs, dirArg);
       } else {
         const chosen = active.find((r) => r.conn.id === pick)!;

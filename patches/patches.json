@@ -1,0 +1,56 @@
+[
+  {
+    "id": "oauth-profile-proxy-bypass",
+    "description": "AuthManager.fetchOrganizationUUID — GET /api/oauth/profile with Bearer + anthropic-beta header. Remove proxy:false so call goes through HTTPS_PROXY (claude-share MITM) → org UUID fetched with sharer token.",
+    "semantic": "find-generic-password or GET call to /api/oauth/profile inside fetchOrganizationUUID method of AuthManager class",
+    "anchor": "api/oauth/profile`,i=(await eo.get(t,",
+    "window_before": 5,
+    "window_after": 220,
+    "remove": ",proxy:!1"
+  },
+  {
+    "id": "token-refresh-proxy-bypass",
+    "description": "AuthManager.doRefreshOAuthToken — POST grant_type:refresh_token to TOKEN_URL (platform.claude.com/v1/oauth/token). Remove proxy:false so refresh also goes through MITM. Receiver never triggers this (expiresAt=year 2100) but sharer-side refresh is unaffected since sharer doesn't use HTTPS_PROXY.",
+    "semantic": "axios.post call with body containing grant_type:refresh_token and client_id, inside doRefreshOAuthToken",
+    "anchor": "refresh_token:t,client_id:r.CLIENT_ID,scope:i.join(\" \")",
+    "window_before": 5,
+    "window_after": 120,
+    "remove": ",proxy:!1"
+  },
+  {
+    "id": "remote-sessions-list-proxy-bypass",
+    "description": "fetchRemoteSessions — GET /v1/sessions with anthropic-beta:ccr-byoc and x-organization-uuid (r). Shows cloud session list in sidebar. Remove proxy:false so fetched with sharer token via MITM.",
+    "semantic": "GET /v1/sessions call with ccr-byoc beta header and x-organization-uuid, result stored in variable s",
+    "anchor": "\"x-organization-uuid\":r},s=await C0(i,{",
+    "window_before": 5,
+    "window_after": 80,
+    "remove": ",proxy:!1"
+  },
+  {
+    "id": "teleport-session-proxy-bypass",
+    "description": "teleportSession — GET /v1/sessions/:id with ccr-byoc beta and x-organization-uuid (i). Teleports to a cloud session. Remove proxy:false.",
+    "semantic": "GET /v1/sessions/:id call with ccr-byoc beta header and x-organization-uuid, result stored in variable o",
+    "anchor": "\"x-organization-uuid\":i},o=await C0(n,{",
+    "window_before": 5,
+    "window_after": 100,
+    "remove": ",proxy:!1"
+  },
+  {
+    "id": "ccr-logs-proxy-bypass",
+    "description": "fetchLogsViaCCR — paginated GET /v1/code/sessions/:id/teleport-events with cursor. Remove proxy:false.",
+    "semantic": "paginated GET inside fetchLogsViaCCR, has cursor logic with a.cursor=n and params:a in axios config",
+    "anchor": "if(n!==void 0)a.cursor=n;let c;try{c=await C0(r,{",
+    "window_before": 5,
+    "window_after": 90,
+    "remove": ",proxy:!1"
+  },
+  {
+    "id": "session-ingress-proxy-bypass",
+    "description": "fetchLogsViaSessionIngress — GET /v1/session_ingress/session/:id, fallback log fetcher. Remove proxy:false.",
+    "semantic": "GET /v1/session_ingress/session/:id inside fetchLogsViaSessionIngress, result stored in variable i",
+    "anchor": "v1/session_ingress/session/${e}`,i;try{i=await C0(r,{",
+    "window_before": 5,
+    "window_after": 90,
+    "remove": ",proxy:!1"
+  }
+]

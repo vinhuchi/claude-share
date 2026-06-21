@@ -8,8 +8,20 @@ import {
   type Machine,
   type Session,
 } from "../session/manager.js";
+import {
+  getTotalStats,
+  getMachineStats,
+  subscribeTokens,
+  type TokenStats,
+} from "../proxy/tokenCounter.js";
 
 const IS_DEV = process.env.NODE_ENV === "development";
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
 
 type View = "pairing" | "machines" | "sessions";
 
@@ -108,18 +120,33 @@ export function App({
     null,
   );
   const [copied, setCopied] = useState(false);
+  const [totalStats, setTotalStats] = useState<TokenStats>(() => getTotalStats());
+  const [machineStats, setMachineStats] = useState<Map<string, TokenStats>>(new Map());
 
   useEffect(() => {
     const interval = setInterval(() => {
       const session = getSession();
       if (!session) return;
       setPairingCode(session.pairingCode);
-      setMachines([...session.machines.values()]);
+      const ms = [...session.machines.values()];
+      setMachines(ms);
+      setMachineStats(new Map(ms.map((m) => [m.id, getMachineStats(m.id)])));
       if (session.pairingCodeUsed) {
         setView((v) => (v === "pairing" ? "machines" : v));
       }
     }, 1000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    return subscribeTokens(() => {
+      setTotalStats(getTotalStats());
+      const session = getSession();
+      if (!session) return;
+      setMachineStats(
+        new Map([...session.machines.keys()].map((id) => [id, getMachineStats(id)])),
+      );
+    });
   }, []);
 
   useEffect(() => {
@@ -186,6 +213,12 @@ export function App({
         </Text>
         <Text dimColor>{formatExpiry(sharedUntil)} remaining</Text>
         <Text dimColor>:{localPort}</Text>
+        {totalStats.requests > 0 && (
+          <Text dimColor>
+            {fmtTokens(totalStats.inputTokens + totalStats.outputTokens)} tok
+            {" · "}{totalStats.requests} req
+          </Text>
+        )}
         {tunnelDown && (
           <Text color="red">
             ⚠ tunnel disconnected — receivers can't connect
@@ -256,6 +289,7 @@ export function App({
               const active = [...m.sessions.values()].some((s) => s.active);
               const last = latestActivity(m);
               const cursor = i === cursorIdx;
+              const mStats = machineStats.get(m.id);
               return (
                 <Box key={m.id} gap={1}>
                   <Text color={cursor ? "cyan" : undefined}>
@@ -264,6 +298,11 @@ export function App({
                   <Text color={active ? "green" : "yellow"}>●</Text>
                   <Text bold={cursor}>{m.name}</Text>
                   <Text dimColor>— {formatRelative(last)}</Text>
+                  {mStats && mStats.requests > 0 && (
+                    <Text dimColor>
+                      [{fmtTokens(mStats.inputTokens + mStats.outputTokens)} tok · {mStats.requests} req]
+                    </Text>
+                  )}
                 </Box>
               );
             })

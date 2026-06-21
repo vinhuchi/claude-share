@@ -33,6 +33,19 @@ export function ensureOnboarding() {
   }
 }
 
+export function applySharerAccount(sharerAccount: { emailAddress: string; displayName: string; organizationName: string }) {
+  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
+  } catch {}
+
+  config["userEmail"] = sharerAccount.emailAddress;
+  config["organizationName"] = sharerAccount.organizationName;
+
+  fs.writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
 // ── Credentials ───────────────────────────────────────────────────────────────
 
 const PLACEHOLDER_CREDENTIALS = {
@@ -127,6 +140,7 @@ export async function launchClaude(
   await ensureCredentials();
 
   if (sharerAccount) {
+    applySharerAccount(sharerAccount);
     p.log.info(
       `Account: ${sharerAccount.displayName} (${sharerAccount.emailAddress})`,
     );
@@ -244,6 +258,54 @@ export async function launchClaude(
     try {
       fs.unlinkSync(tmpCert);
     } catch {}
+    process.exit(1);
+  });
+
+  process.on("SIGINT", () => child.kill("SIGINT"));
+  process.on("SIGTERM", () => child.kill("SIGTERM"));
+}
+
+// ── Real mode (own account, no proxy) ─────────────────────────────────────────
+
+export async function launchClaudeReal(
+  claudeArgs: string[] = [],
+  cwd?: string,
+) {
+  if (!(await checkClaudeInstalled())) {
+    p.log.error("Claude Code is not installed or not in PATH.");
+    p.log.info("Install it with: npm install -g @anthropic-ai/claude-code");
+    process.exit(1);
+  }
+
+  p.log.success("\x1b[32mLaunching Claude (own account)...\x1b[0m");
+  p.outro("");
+
+  const startTime = Date.now();
+
+  // Strip any proxy env vars that may be set from a previous share session
+  const env = { ...process.env };
+  delete env.HTTPS_PROXY;
+  delete env.HTTP_PROXY;
+  delete env.NODE_EXTRA_CA_CERTS;
+
+  const child = spawn("claude", claudeArgs, {
+    stdio: "inherit",
+    shell: process.platform === "win32",
+    ...(cwd ? { cwd } : {}),
+    env,
+  });
+
+  child.on("exit", (code) => {
+    const duration = Math.floor((Date.now() - startTime) / 1000);
+    const mins = Math.floor(duration / 60);
+    const secs = duration % 60;
+    p.log.info(`Session ended. Duration: ${mins}m ${secs}s`);
+    process.exit(code ?? 0);
+  });
+
+  child.on("error", (err) => {
+    logger.error("Failed to launch claude process", err);
+    p.log.error(`Failed to launch claude: ${err.message}`);
     process.exit(1);
   });
 

@@ -4,3 +4,5 @@ dist/
 .env
 .http-mitm-proxy
 claude-share-dev.log
+*.bun-build
+patches/adapt-prompt.md
