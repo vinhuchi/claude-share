@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import zlib from "node:zlib";
 
 import { Proxy } from "http-mitm-proxy";
 
@@ -13,11 +14,8 @@ import { recordTokens } from "./tokenCounter";
 import { getAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
 
-// Per-request log id stored on ctx so onResponse can update it
 const CTX_LOG_ID = Symbol("logId");
-// machineId resolved from CONNECT auth, stored per-request
 const CTX_MACHINE_ID = Symbol("machineId");
-// socket → machineId (populated during CONNECT, reused for all requests on that tunnel)
 const socketMachineId = new WeakMap<object, string>();
 
 // Domains the proxy intercepts and forwards to Anthropic with injected token
@@ -242,6 +240,7 @@ export async function createMitmProxy(
         reqPath.startsWith("/v1/messages");
 
       if (isMessages) {
+        const encoding = (ctx.serverToProxyResponse?.headers?.["content-encoding"] ?? "") as string;
         const chunks: Buffer[] = [];
         ctx.addResponseFilter(
           new Transform({
@@ -251,16 +250,20 @@ export async function createMitmProxy(
               done();
             },
             flush(done) {
-              const body = Buffer.concat(chunks).toString("utf8");
-              // Works for both streaming SSE and non-streaming JSON:
-              // - SSE: input_tokens in message_start, output_tokens in message_delta
-              // - JSON: both in top-level usage object
+              const raw = Buffer.concat(chunks);
+              const decode = (buf: Buffer): string => {
+                try {
+                  if (encoding === "gzip") return zlib.gunzipSync(buf).toString("utf8");
+                  if (encoding === "deflate") return zlib.inflateSync(buf).toString("utf8");
+                  if (encoding === "br") return zlib.brotliDecompressSync(buf).toString("utf8");
+                } catch {}
+                return buf.toString("utf8");
+              };
+              const body = decode(raw);
               const inp = parseInt(body.match(/"input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
               const out = parseInt(body.match(/"output_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
               const cache = parseInt(body.match(/"cache_read_input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
-              if (inp > 0 || out > 0) {
-                recordTokens(machineId!, inp, out, cache);
-              }
+              if (inp > 0 || out > 0) recordTokens(machineId!, inp, out, cache);
               done();
             },
           }),

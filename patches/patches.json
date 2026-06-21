@@ -54,6 +54,16 @@
     "remove": ",proxy:!1"
   },
   {
+    "id": "statusbar-claude-share",
+    "description": "Inject a VS Code status bar item into activate() that polls ~/.claude-share/active-connection.json every 5s. Shows '$(cloud-upload) claude-share · Xh Ym left' when proxy is active, hides when expired or missing.",
+    "semantic": "start of activate() function (yot) — right after createOutputChannel and first subscriptions.push, before setContext updateSupported call",
+    "anchor": "e.subscriptions.push(t),Se.commands.executeCommand(\"setContext\",\"claude-vscode.updateSupported\",!1);",
+    "window_before": 0,
+    "window_after": 0,
+    "find": "e.subscriptions.push(t),Se.commands.executeCommand(\"setContext\",\"claude-vscode.updateSupported\",!1);",
+    "replace_with": "e.subscriptions.push(t),(function(){const _sb=Se.window.createStatusBarItem(Se.StatusBarAlignment.Right,1000);e.subscriptions.push(_sb);let _notified=false;function _cs(){try{const _f=require(\"fs\"),_o=require(\"os\"),_p=require(\"path\"),_c=JSON.parse(_f.readFileSync(_p.join(_o.homedir(),\".claude-share\",\"active-connection.json\"),\"utf8\"));if(_c&&_c.expiresAt&&Date.now()<_c.expiresAt){const _m=Math.round((_c.expiresAt-Date.now())/60000),_exp=_m>60?Math.floor(_m/60)+\"h \"+((_m%60)||\"\")+\"m\":_m+\"m\";_sb.text=\"$(cloud-upload) claude-connect\";_sb.tooltip=\"claude-connect: proxy active \\u00b7 \"+_exp+\" remaining\";_sb.backgroundColor=new Se.ThemeColor(\"statusBarItem.warningBackground\");_sb.show();if(!_notified){_notified=true;Se.window.showInformationMessage(\"\\u2601\\ufe0f claude-connect proxy active \\u2014 \"+_exp+\" remaining\");}}else{_sb.text=\"$(circle-slash) claude-connect\";_sb.tooltip=\"claude-connect: not connected \\u00b7 run claude-connect to pair\";_sb.backgroundColor=undefined;_sb.show();_notified=false;}}catch(_e){_sb.text=\"$(circle-slash) claude-connect\";_sb.tooltip=\"claude-connect: not connected \\u00b7 run claude-connect to pair\";_sb.backgroundColor=undefined;_sb.show();_notified=false;}}_cs();const _t=setInterval(_cs,5e3);e.subscriptions.push({dispose:()=>clearInterval(_t)});})(),Se.commands.executeCommand(\"setContext\",\"claude-vscode.updateSupported\",!1);"
+  },
+  {
     "id": "inject-claude-share-proxy",
     "description": "Td() builds the env object passed to claude.exe spawn ({...process.env}). Inject: read ~/.claude-share/active-connection.json and set HTTPS_PROXY + NODE_EXTRA_CA_CERTS so claude.exe and extension axios calls both use claude-share MITM without any system env var setup.",
     "semantic": "end of Td() function — return statement that sets CLAUDE_CODE_ENTRYPOINT=claude-vscode and returns the env object r",
