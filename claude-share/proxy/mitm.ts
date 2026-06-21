@@ -82,9 +82,13 @@ export async function createMitmProxy(
   publicHostname: string = "bore.pub",
   getSession: (() => import("../session/manager").Session | null) | null = null,
 ): Promise<MitmProxy> {
-  const sslCaDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), "claude-share-mitm-"),
-  );
+  // Persist the MITM CA across restarts. http-mitm-proxy generates the CA into
+  // <sslCaDir>/certs/ca.pem + keys/ca.private.key on first listen and reuses it
+  // if already present — so a stable dir keeps the CA fingerprint constant.
+  // (A fresh temp dir per run rotated the CA, invalidating every receiver's
+  // saved caPem and breaking reconnects after a sharer restart.)
+  const sslCaDir = path.join(os.homedir(), ".claude-share", "mitm-ca");
+  await fs.promises.mkdir(sslCaDir, { recursive: true, mode: 0o700 });
 
   return new Promise<MitmProxy>((resolve, reject) => {
     let proxyPort = 0;

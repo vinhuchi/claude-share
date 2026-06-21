@@ -151,6 +151,29 @@ export function clearActiveConnection(): void {
   } catch {}
 }
 
+/**
+ * Removes all saved credentials: every connection file, active-connection.json,
+ * and the cached ca.pem. Keeps config.json (device name + terms agreement).
+ * Returns how many connection files were removed.
+ */
+export function resetAll(): { connections: number } {
+  ensureConnectionsDir();
+  let connections = 0;
+  for (const f of fs
+    .readdirSync(CONNECTIONS_DIR)
+    .filter((f) => f.endsWith(".json"))) {
+    try {
+      fs.unlinkSync(path.join(CONNECTIONS_DIR, f));
+      connections++;
+    } catch {}
+  }
+  clearActiveConnection();
+  try {
+    fs.unlinkSync(path.join(CLAUDE_SHARE_DIR, "ca.pem"));
+  } catch {}
+  return { connections };
+}
+
 export function findConnectionByServerUrl(
   serverUrl: string,
 ): SavedConnection | null {

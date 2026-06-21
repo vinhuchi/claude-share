@@ -5,6 +5,8 @@ import React, { useState, useEffect, useCallback } from "react";
 
 import {
   regeneratePairingCode,
+  removeMachine,
+  saveSession,
   type Machine,
   type Session,
 } from "../session/manager.js";
@@ -119,6 +121,7 @@ export function App({
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(
     null,
   );
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [totalStats, setTotalStats] = useState<TokenStats>(() => getTotalStats());
   const [machineStats, setMachineStats] = useState<Map<string, TokenStats>>(new Map());
@@ -166,6 +169,21 @@ export function App({
       return;
     }
 
+    // Delete-confirmation prompt takes priority over every other key.
+    if (confirmDeleteId) {
+      if (input === "1") {
+        const session = getSession();
+        if (session && removeMachine(session, confirmDeleteId)) {
+          saveSession(session);
+          setMachines([...session.machines.values()]);
+        }
+        setConfirmDeleteId(null);
+      } else if (input === "2" || key.escape) {
+        setConfirmDeleteId(null);
+      }
+      return;
+    }
+
     if (view === "machines") {
       if (key.upArrow) setCursorIdx((i) => Math.max(0, i - 1));
       if (key.downArrow)
@@ -173,6 +191,9 @@ export function App({
       if (key.return && machines.length > 0) {
         setSelectedMachineId(machines[cursorIdx]?.id ?? null);
         setView("sessions");
+      }
+      if (input === "d" && machines.length > 0) {
+        setConfirmDeleteId(machines[cursorIdx]?.id ?? null);
       }
     }
 
@@ -202,6 +223,10 @@ export function App({
 
   const selectedMachine = selectedMachineId
     ? (machines.find((m) => m.id === selectedMachineId) ?? null)
+    : null;
+
+  const confirmDeleteMachine = confirmDeleteId
+    ? (machines.find((m) => m.id === confirmDeleteId) ?? null)
     : null;
 
   return (
@@ -310,6 +335,32 @@ export function App({
         </Box>
       )}
 
+      {/* Delete confirmation */}
+      {confirmDeleteMachine && (
+        <Box
+          flexDirection="column"
+          borderStyle="round"
+          borderColor="red"
+          paddingX={2}
+          marginTop={1}
+        >
+          <Text bold color="red">
+            Remove "{confirmDeleteMachine.name}"?
+          </Text>
+          <Text dimColor>
+            Revokes its access immediately — it must pair again to reconnect.
+          </Text>
+          <Box marginTop={1} gap={2}>
+            <Text>
+              <Text bold color="green">1</Text> <Text dimColor>remove</Text>
+            </Text>
+            <Text>
+              <Text bold>2</Text> <Text dimColor>cancel</Text>
+            </Text>
+          </Box>
+        </Box>
+      )}
+
       {/* Sessions detail */}
       {view === "sessions" && selectedMachine && (
         <Box flexDirection="column">
@@ -345,9 +396,12 @@ export function App({
           ) : (
             <Text dimColor>c copy url</Text>
           ))}
-        {view === "machines" && (
-          <Text dimColor>↑↓ select · enter view sessions · n new pairing</Text>
+        {view === "machines" && !confirmDeleteId && (
+          <Text dimColor>
+            ↑↓ select · enter view sessions · d remove · n new pairing
+          </Text>
         )}
+        {confirmDeleteId && <Text dimColor>1 remove · 2 cancel</Text>}
         {view === "sessions" && <Text dimColor>esc back · n new pairing</Text>}
       </Box>
     </Box>

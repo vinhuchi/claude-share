@@ -19,6 +19,7 @@ if (process.argv.includes("--upgrade")) {
 import { pairFlow } from "./flows/pair";
 import { reconnectFlow } from "./flows/reconnect";
 import { listFlow } from "./flows/list";
+import { cleanupFlow } from "./flows/cleanup";
 import { resolveActiveUrl, resolveAnyActive } from "./health";
 import { launchClaude, launchClaudeReal } from "./launch";
 import { logger } from "./logger";
@@ -98,6 +99,11 @@ const dirArg = args.find((a) => a.startsWith("--dir="))?.slice("--dir=".length).
 const shareArg = args.find((a) => a.startsWith("--share="));
 
 pruneExpiredConnections();
+
+// --cleanup wipes saved credentials and exits; no need to agree to terms first.
+if (args.includes("--cleanup")) {
+  await cleanupFlow();
+}
 
 if (!hasAgreedToTerms()) {
   p.intro("claude-connect");

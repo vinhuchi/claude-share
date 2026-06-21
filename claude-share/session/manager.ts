@@ -126,6 +126,17 @@ export function addMachine(session: Session, name: string): Machine {
   return machine;
 }
 
+/**
+ * Removes a paired machine, immediately revoking its proxy credentials.
+ * After this, checkMachineAuth/resolveMachineId stop matching it, so its next
+ * request (API or MITM CONNECT) is rejected with 407. Returns true if removed.
+ */
+export function removeMachine(session: Session, machineId: string): boolean {
+  const removed = session.machines.delete(machineId);
+  if (removed && session.machines.size === 0) session.status = "waiting";
+  return removed;
+}
+
 /** Returns true if the Proxy-Authorization header matches any active machine. */
 export function checkMachineAuth(session: Session, authHeader: string): boolean {
   for (const machine of session.machines.values()) {
