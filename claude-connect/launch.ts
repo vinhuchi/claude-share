@@ -9,6 +9,7 @@ import * as p from "@clack/prompts";
 import { platform } from "@shared/platforms";
 import { apiFetch } from "./fetch";
 import { logger } from "./logger";
+import { clearActiveConnection } from "./storage";
 import type { SharerAccount } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -276,6 +277,9 @@ export async function launchClaudeReal(
     p.log.info("Install it with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
   }
+
+  // Remove active-connection.json so VS Code extension patch doesn't inject proxy
+  clearActiveConnection();
 
   p.log.success("\x1b[32mLaunching Claude (own account)...\x1b[0m");
   p.outro("");

@@ -99,6 +99,12 @@ export function pruneExpiredConnections(): void {
   }
 }
 
+export function clearActiveConnection(): void {
+  try {
+    fs.unlinkSync(path.join(CLAUDE_SHARE_DIR, "active-connection.json"));
+  } catch {}
+}
+
 export function findConnectionByServerUrl(
   serverUrl: string,
 ): SavedConnection | null {

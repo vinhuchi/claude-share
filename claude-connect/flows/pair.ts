@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 
 import * as p from "@clack/prompts";
 
@@ -7,11 +8,37 @@ import { launchClaude } from "../launch";
 import { logger } from "../logger";
 import { decryptBlob, parseConnectUrl } from "../pairing";
 import {
+  CLAUDE_SHARE_DIR,
   connectionPath,
   ensureConnectionsDir,
   getDeviceName,
 } from "../storage";
 import type { ConnectionFile, SavedConnection } from "../types";
+
+function writeActiveConnection(file: ConnectionFile, serverUrl: string): void {
+  try {
+    fs.mkdirSync(CLAUDE_SHARE_DIR, { recursive: true });
+
+    const caPemPath = path.join(CLAUDE_SHARE_DIR, "ca.pem");
+    fs.writeFileSync(caPemPath, file.caPem, { mode: 0o600 });
+
+    const rawUrl = file.publicServerUrl ?? file.lanServerUrl ?? serverUrl;
+    const parsedProxy = new URL(rawUrl);
+    parsedProxy.username = encodeURIComponent(file.proxyUser);
+    parsedProxy.password = encodeURIComponent(file.proxyPass);
+    const proxyUrl = parsedProxy.toString();
+
+    const expiresAt = new Date(file.sharedUntil).getTime();
+    const configPath = path.join(CLAUDE_SHARE_DIR, "active-connection.json");
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ proxyUrl, caPemPath, expiresAt }, null, 2),
+      { mode: 0o600 },
+    );
+  } catch (err) {
+    logger.warn("Failed to write active-connection.json", err);
+  }
+}
 
 export async function pairFlow(
   prefill?: { serverUrl: string; pairingCode: string },
@@ -115,6 +142,9 @@ export async function pairFlow(
   }
 
   spin.stop("Paired successfully.");
+
+  // Write active-connection.json for VS Code extension auto-proxy injection
+  writeActiveConnection(file, serverUrl);
 
   ensureConnectionsDir();
   const saved: SavedConnection = {

@@ -52,5 +52,15 @@
     "window_before": 5,
     "window_after": 90,
     "remove": ",proxy:!1"
+  },
+  {
+    "id": "inject-claude-share-proxy",
+    "description": "Td() builds the env object passed to claude.exe spawn ({...process.env}). Inject: read ~/.claude-share/active-connection.json and set HTTPS_PROXY + NODE_EXTRA_CA_CERTS so claude.exe and extension axios calls both use claude-share MITM without any system env var setup.",
+    "semantic": "end of Td() function — return statement that sets CLAUDE_CODE_ENTRYPOINT=claude-vscode and returns the env object r",
+    "anchor": "return r.CLAUDE_CODE_ENTRYPOINT=\"claude-vscode\",r}",
+    "window_before": 5,
+    "window_after": 5,
+    "find": "return r.CLAUDE_CODE_ENTRYPOINT=\"claude-vscode\",r}",
+    "replace_with": "try{const _f=require(\"fs\"),_p=require(\"path\"),_o=require(\"os\"),_cfg=JSON.parse(_f.readFileSync(_p.join(_o.homedir(),\".claude-share\",\"active-connection.json\"),\"utf8\"));if(_cfg&&_cfg.expiresAt&&Date.now()<_cfg.expiresAt){if(_cfg.proxyUrl){r.HTTPS_PROXY=_cfg.proxyUrl;r.HTTP_PROXY=_cfg.proxyUrl;process.env.HTTPS_PROXY=_cfg.proxyUrl;}if(_cfg.caPemPath){r.NODE_EXTRA_CA_CERTS=_cfg.caPemPath;process.env.NODE_EXTRA_CA_CERTS=_cfg.caPemPath;}}}catch(_e){}return r.CLAUDE_CODE_ENTRYPOINT=\"claude-vscode\",r}"
   }
 ]

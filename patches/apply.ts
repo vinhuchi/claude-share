@@ -25,7 +25,11 @@ interface Patch {
   anchor: string;
   window_before: number;
   window_after: number;
-  remove: string;
+  // remove: delete this string (shorthand for find+replace with empty replacement)
+  remove?: string;
+  // find + replace_with: replace find with replace_with within the window
+  find?: string;
+  replace_with?: string;
 }
 
 function findExtensionDir(base?: string): string {
@@ -59,15 +63,20 @@ function applyPatch(code: string, patch: Patch): { code: string; ok: boolean; er
   const winEnd = Math.min(code.length, anchorIdx + patch.anchor.length + patch.window_after);
   const window = code.slice(winStart, winEnd);
 
-  const removeIdx = window.indexOf(patch.remove);
-  if (removeIdx === -1) {
-    return { code, ok: false, error: `"${patch.remove}" not found in window around anchor` };
+  const needle = patch.find ?? patch.remove ?? "";
+  const replacement = patch.find !== undefined ? (patch.replace_with ?? "") : "";
+  if (!needle) return { code, ok: false, error: "patch has neither 'remove' nor 'find'" };
+
+  const needleIdx = window.indexOf(needle);
+  if (needleIdx === -1) {
+    return { code, ok: false, error: `"${needle.slice(0, 60)}" not found in window around anchor` };
   }
 
   const patched =
     code.slice(0, winStart) +
-    window.slice(0, removeIdx) +
-    window.slice(removeIdx + patch.remove.length) +
+    window.slice(0, needleIdx) +
+    replacement +
+    window.slice(needleIdx + needle.length) +
     code.slice(winEnd);
 
   return { code: patched, ok: true };
