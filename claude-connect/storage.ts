@@ -4,6 +4,34 @@ import path from "node:path";
 
 import type { ReceiverConfig, SavedConnection } from "./types";
 
+export function writeActiveConnection(conn: SavedConnection, resolvedUrl: string): void {
+  try {
+    fs.mkdirSync(CLAUDE_SHARE_DIR, { recursive: true });
+
+    const caPemPath = path.join(CLAUDE_SHARE_DIR, "ca.pem");
+    fs.writeFileSync(caPemPath, conn.caPem, { mode: 0o600 });
+
+    const parsedProxy = new URL(resolvedUrl);
+    parsedProxy.username = encodeURIComponent(conn.proxyUser);
+    parsedProxy.password = encodeURIComponent(conn.proxyPass);
+    const proxyUrl = parsedProxy.toString();
+
+    const expiresAt = new Date(conn.sharedUntil).getTime();
+    fs.writeFileSync(
+      path.join(CLAUDE_SHARE_DIR, "active-connection.json"),
+      JSON.stringify({
+        proxyUrl,
+        caPemPath,
+        expiresAt,
+        sharerEmail: conn.sharerAccount?.emailAddress ?? null,
+        sharerOrg: conn.sharerAccount?.organizationName ?? null,
+        sharerName: conn.sharerAccount?.displayName ?? null,
+      }, null, 2),
+      { mode: 0o600 },
+    );
+  } catch {}
+}
+
 // ── Paths ────────────────────────────────────────────────────────────────────
 
 export const CLAUDE_SHARE_DIR = path.join(os.homedir(), ".claude-share");

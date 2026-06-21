@@ -2,6 +2,12 @@ import { cache } from "@shared/cache";
 import { apiFetch } from "./fetch";
 import type { SavedConnection } from "./types";
 
+export interface ActiveConnection {
+  conn: SavedConnection;
+  url: string;
+  sessionId: string | null;
+}
+
 interface HealthResult {
   alive: boolean;
   sessionId: string | null;
@@ -100,4 +106,24 @@ export async function resolveActiveUrl(
   const result = await Promise.race([race, overallTimeout]);
   if (result.alive) cache.set(cacheKey, result, 30_000);
   return result;
+}
+
+/**
+ * Scans all saved connections in parallel and returns the first alive one.
+ * Used as fallback when the active connection changes (sharer restart, URL change).
+ */
+export async function resolveAnyActive(
+  connections: SavedConnection[],
+): Promise<ActiveConnection | null> {
+  if (connections.length === 0) return null;
+
+  const results = await Promise.all(
+    connections.map(async (conn) => {
+      const resolved = await resolveActiveUrl(conn);
+      if (!resolved.alive) return null;
+      return { conn, url: resolved.url, sessionId: resolved.sessionId };
+    }),
+  );
+
+  return results.find((r) => r !== null) ?? null;
 }

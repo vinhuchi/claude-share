@@ -13,6 +13,24 @@ const execFileAsync = promisify(execFile);
 const BORE_SERVER = process.env.BORE_SERVER ?? "bore.pub";
 const BORE_PASSWORD = process.env.BORE_PASSWORD ?? "";
 
+const BORE_PORT_CACHE = path.join(os.homedir(), ".claude-share", "bore-port.json");
+
+function loadSavedBorePort(): number | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(BORE_PORT_CACHE, "utf8"));
+    return typeof data.port === "number" ? data.port : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveBorePort(port: number): void {
+  try {
+    fs.mkdirSync(path.dirname(BORE_PORT_CACHE), { recursive: true });
+    fs.writeFileSync(BORE_PORT_CACHE, JSON.stringify({ port }), { mode: 0o600 });
+  } catch {}
+}
+
 // Where we install bore on Linux when it isn't already in PATH
 const BORE_LOCAL_PATH = path.join(os.homedir(), ".local", "bin", "bore");
 
@@ -199,8 +217,12 @@ export async function startTunnel(
   onDown?: () => void,
 ): Promise<Tunnel> {
   const boreBin = (await getBorePath()) ?? "bore";
+  const savedPort = process.env.BORE_FIXED_PORT
+    ? parseInt(process.env.BORE_FIXED_PORT, 10)
+    : loadSavedBorePort();
   const args = ["local", String(localPort), "--to", BORE_SERVER];
   if (BORE_PASSWORD) args.push("--secret", BORE_PASSWORD);
+  if (savedPort) args.push("--port", String(savedPort));
 
   return new Promise((resolve, reject) => {
     const proc = spawn(boreBin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -221,8 +243,10 @@ export async function startTunnel(
       if (match && !settled) {
         settled = true;
         clearTimeout(timeout);
+        const port = parseInt(match[1], 10);
+        saveBorePort(port);
         resolve({
-          publicUrl: `https://${BORE_SERVER}:${match[1]}`,
+          publicUrl: `https://${BORE_SERVER}:${port}`,
           close() {
             closing = true;
             proc.kill();

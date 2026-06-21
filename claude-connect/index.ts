@@ -19,7 +19,7 @@ if (process.argv.includes("--upgrade")) {
 import { pairFlow } from "./flows/pair";
 import { reconnectFlow } from "./flows/reconnect";
 import { listFlow } from "./flows/list";
-import { resolveActiveUrl } from "./health";
+import { resolveActiveUrl, resolveAnyActive } from "./health";
 import { launchClaude, launchClaudeReal } from "./launch";
 import { logger } from "./logger";
 import { parseConnectUrl } from "./pairing";
@@ -56,6 +56,7 @@ args.forEach((a, i) => {
   if (a === "--list" || a === "-l") ownIdxs.add(i);
   if (a === "--cleanup") ownIdxs.add(i);
   if (a === "--real") ownIdxs.add(i);
+  if (a === "--skip-permissions") ownIdxs.add(i);
   if (a === "--reconnect" || a === "-r") {
     ownIdxs.add(i);
     if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
@@ -63,6 +64,34 @@ args.forEach((a, i) => {
   if (a.startsWith("--share=")) ownIdxs.add(i);
   if (a.startsWith("--dir=")) ownIdxs.add(i);
 });
+
+async function askLaunchMode(currentArgs: string[]): Promise<string[]> {
+  // If already specified via flag, skip prompt
+  if (
+    args.includes("--skip-permissions") ||
+    currentArgs.includes("--dangerously-skip-permissions")
+  ) {
+    return ["--dangerously-skip-permissions", ...currentArgs];
+  }
+  const mode = await p.select({
+    message: "Launch mode:",
+    options: [
+      { value: "normal", label: "Normal", hint: "standard permission prompts" },
+      {
+        value: "skip",
+        label: "Skip permissions",
+        hint: "--dangerously-skip-permissions",
+      },
+    ],
+  });
+  if (p.isCancel(mode)) {
+    p.cancel("Cancelled.");
+    process.exit(0);
+  }
+  return mode === "skip"
+    ? ["--dangerously-skip-permissions", ...currentArgs]
+    : currentArgs;
+}
 
 const claudeArgs = args.filter((_, i) => !ownIdxs.has(i));
 const dirArg = args.find((a) => a.startsWith("--dir="))?.slice("--dir=".length).trim();
@@ -185,16 +214,18 @@ if (args[0] === "--list" || args[0] === "-l") {
         process.exit(0);
       }
       if (pick === "__real__") {
-        await launchClaudeReal(claudeArgs, dirArg);
+        const finalArgs = await askLaunchMode(claudeArgs);
+        await launchClaudeReal(finalArgs, dirArg);
       } else if (pick === "__new__") {
         await pairFlow(undefined, claudeArgs, dirArg);
       } else {
         const chosen = active.find((r) => r.conn.id === pick)!;
+        const finalArgs = await askLaunchMode(claudeArgs);
         await launchClaude(
           chosen.url,
           chosen.conn.caPem,
           chosen.conn,
-          claudeArgs,
+          finalArgs,
           chosen.conn.sharerAccount ?? null,
           dirArg,
         );

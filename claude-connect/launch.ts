@@ -9,8 +9,8 @@ import * as p from "@clack/prompts";
 import { platform } from "@shared/platforms";
 import { apiFetch } from "./fetch";
 import { logger } from "./logger";
-import { clearActiveConnection } from "./storage";
-import type { SharerAccount } from "./types";
+import { clearActiveConnection, writeActiveConnection } from "./storage";
+import type { SavedConnection, SharerAccount } from "./types";
 
 const execFileAsync = promisify(execFile);
 

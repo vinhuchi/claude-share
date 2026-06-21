@@ -1,8 +1,8 @@
 import * as p from "@clack/prompts";
 
-import { resolveActiveUrl } from "../health";
+import { resolveActiveUrl, resolveAnyActive } from "../health";
 import { launchClaude } from "../launch";
-import { loadConnections } from "../storage";
+import { loadConnections, writeActiveConnection } from "../storage";
 import type { SavedConnection } from "../types";
 
 export async function reconnectFlow(
@@ -17,7 +17,10 @@ export async function reconnectFlow(
     process.exit(0);
   }
 
+  p.intro("claude-connect — reconnect");
+
   let chosen: SavedConnection;
+  let resolvedUrl: string;
 
   if (uuid) {
     const match = connections.find((c) => c.id.startsWith(uuid));
@@ -26,34 +29,33 @@ export async function reconnectFlow(
       process.exit(1);
     }
     chosen = match;
-  } else {
-    p.intro("claude-connect — reconnect");
-    const pick = await p.select({
-      message: "Choose a connection:",
-      options: connections.map((c) => ({
-        value: c.id,
-        label: `${c.systemName} — ${c.lanServerUrl ?? c.publicServerUrl ?? ""}`,
-        hint: `saved ${new Date(c.savedAt).toLocaleDateString()}`,
-      })),
-    });
-    if (p.isCancel(pick)) {
-      p.cancel("Cancelled.");
-      process.exit(0);
+    const spin = p.spinner();
+    spin.start(`Checking ${chosen.systemName}...`);
+    const resolved = await resolveActiveUrl(chosen);
+    if (!resolved.alive) {
+      spin.stop("Server offline or session expired.");
+      process.exit(1);
     }
-    chosen = connections.find((c) => c.id === pick)!;
+    spin.stop("Connected.");
+    resolvedUrl = resolved.url;
+  } else {
+    // Auto-scan all connections, use first alive one
+    const spin = p.spinner();
+    spin.start(`Scanning ${connections.length} saved connection(s)...`);
+    const active = await resolveAnyActive(connections);
+    if (!active) {
+      spin.stop("No active sharers found.");
+      process.exit(1);
+    }
+    spin.stop(`Found: ${active.conn.systemName}`);
+    chosen = active.conn;
+    resolvedUrl = active.url;
+    // Keep active-connection.json fresh
+    writeActiveConnection(chosen, resolvedUrl);
   }
-
-  const spin = p.spinner();
-  spin.start(`Checking ${chosen.systemName}...`);
-  const resolved = await resolveActiveUrl(chosen);
-  if (!resolved.alive) {
-    spin.stop("Server offline or session expired.");
-    process.exit(1);
-  }
-  spin.stop("Server is alive.");
 
   await launchClaude(
-    resolved.url,
+    resolvedUrl,
     chosen.caPem,
     chosen,
     claudeArgs,
