@@ -52,6 +52,9 @@ export async function apiFetch(
         },
         (res) => {
           let data = "";
+          // Decode as UTF-8 so multi-byte sequences split across TCP chunks
+          // aren't corrupted by per-chunk Buffer-to-string coercion.
+          res.setEncoding("utf8");
           res.on("data", (chunk: string) => {
             data += chunk;
           });
@@ -60,7 +63,16 @@ export async function apiFetch(
             resolve({
               ok: status >= 200 && status < 300,
               status,
-              json: () => Promise.resolve(JSON.parse(data)),
+              // Parse lazily inside the promise so a malformed body rejects
+              // the returned promise instead of throwing synchronously.
+              json: () =>
+                new Promise((res, rej) => {
+                  try {
+                    res(JSON.parse(data));
+                  } catch (e) {
+                    rej(e);
+                  }
+                }),
             });
           });
           res.on("error", reject);

@@ -26,7 +26,10 @@ export function parseConnectUrl(
 ): { serverUrl: string; pairingCode: string } | null {
   if (!/^(claudeshare|https):\/\//.test(url)) return null;
   const normalised = url.replace(/^claudeshare:\/\//, "https://");
-  const match = normalised.match(/^(https:\/\/.+?)\/connect\/([A-Za-z0-9]+)$/);
+  // Tolerate an optional trailing slash and ignore any query string / hash.
+  const match = normalised.match(
+    /^(https:\/\/.+?)\/connect\/([A-Za-z0-9]+)\/?(?:[?#].*)?$/,
+  );
   if (!match) return null;
   return { serverUrl: match[1], pairingCode: match[2] };
 }

@@ -4,6 +4,18 @@ import path from "node:path";
 
 import type { ReceiverConfig, SavedConnection } from "./types";
 
+// Embed proxy credentials (URL-encoded) into a base server URL.
+export function buildProxyUrl(
+  baseUrl: string,
+  user: string,
+  pass: string,
+): string {
+  const parsed = new URL(baseUrl);
+  parsed.username = encodeURIComponent(user);
+  parsed.password = encodeURIComponent(pass);
+  return parsed.toString();
+}
+
 export function writeActiveConnection(conn: SavedConnection, resolvedUrl: string): void {
   try {
     fs.mkdirSync(CLAUDE_SHARE_DIR, { recursive: true });
@@ -11,10 +23,7 @@ export function writeActiveConnection(conn: SavedConnection, resolvedUrl: string
     const caPemPath = path.join(CLAUDE_SHARE_DIR, "ca.pem");
     fs.writeFileSync(caPemPath, conn.caPem, { mode: 0o600 });
 
-    const parsedProxy = new URL(resolvedUrl);
-    parsedProxy.username = encodeURIComponent(conn.proxyUser);
-    parsedProxy.password = encodeURIComponent(conn.proxyPass);
-    const proxyUrl = parsedProxy.toString();
+    const proxyUrl = buildProxyUrl(resolvedUrl, conn.proxyUser, conn.proxyPass);
 
     const expiresAt = new Date(conn.sharedUntil).getTime();
     fs.writeFileSync(
@@ -85,6 +94,15 @@ export function saveTermsAgreed(): void {
 }
 
 // ── Connection persistence ────────────────────────────────────────────────────
+
+export function writeConnection(conn: SavedConnection): void {
+  ensureConnectionsDir();
+  fs.writeFileSync(
+    connectionPath(conn.id),
+    JSON.stringify(conn, null, 2),
+    { mode: 0o600 },
+  );
+}
 
 export function loadConnections(): SavedConnection[] {
   ensureConnectionsDir();

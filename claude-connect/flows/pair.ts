@@ -5,12 +5,18 @@ import { launchClaude } from "../launch";
 import { logger } from "../logger";
 import { decryptBlob, parseConnectUrl } from "../pairing";
 import {
-  connectionPath,
-  ensureConnectionsDir,
   getDeviceName,
   writeActiveConnection,
+  writeConnection,
 } from "../storage";
 import type { ConnectionFile, SavedConnection } from "../types";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Security (see CLAUDE.md): only the first 5 chars of the pairingCode may be
+// sent over HTTP for session lookup — the full code is the private decryption key.
+const PAIRING_LOOKUP_PREFIX_LEN = 5;
 
 export async function pairFlow(
   prefill?: { serverUrl: string; pairingCode: string },
@@ -58,6 +64,14 @@ export async function pairFlow(
     }
   }
 
+  let serverHostname: string;
+  try {
+    serverHostname = new URL(serverUrl).hostname;
+  } catch {
+    p.log.error(`Invalid server URL: ${serverUrl}`);
+    process.exit(1);
+  }
+
   const name = getDeviceName();
   p.log.info(`Connecting as "${name}"`);
 
@@ -72,7 +86,10 @@ export async function pairFlow(
     const res = await apiFetch(`${serverUrl}/pair`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: pairingCode.slice(0, 5), name }),
+      body: JSON.stringify({
+        code: pairingCode.slice(0, PAIRING_LOOKUP_PREFIX_LEN),
+        name,
+      }),
       timeout: 10_000,
       rejectUnauthorized: false,
     });
@@ -90,8 +107,11 @@ export async function pairFlow(
     const data = (await res.json()) as { blob: string; machineId: string };
     blob = data.blob;
     connectionId = data.machineId;
-    const UUID_RE =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (typeof blob !== "string") {
+      spin.stop("Failed.");
+      p.log.error("Server returned a malformed response.");
+      process.exit(1);
+    }
     if (!UUID_RE.test(connectionId)) {
       spin.stop("Failed.");
       p.log.error("Server returned an invalid machine ID.");
@@ -115,10 +135,9 @@ export async function pairFlow(
 
   spin.stop("Paired successfully.");
 
-  ensureConnectionsDir();
   const saved: SavedConnection = {
     id: connectionId,
-    systemName: file.systemName ?? new URL(serverUrl).hostname,
+    systemName: file.systemName ?? serverHostname,
     lanServerUrl: file.lanServerUrl,
     publicServerUrl: file.publicServerUrl,
     sessionId: file.sessionId,
@@ -129,17 +148,16 @@ export async function pairFlow(
     proxyUser: file.proxyUser,
     proxyPass: file.proxyPass,
   };
-  fs.writeFileSync(
-    connectionPath(connectionId),
-    JSON.stringify(saved, null, 2),
-  );
+  writeConnection(saved);
 
-  // Write active-connection.json for VS Code extension auto-proxy injection
+  // Use the best available route for both the VS Code extension's
+  // active-connection.json and the launched Claude proxy/session, matching
+  // reconnect's "best route" semantics.
   const bestUrl = file.publicServerUrl ?? file.lanServerUrl ?? serverUrl;
   writeActiveConnection(saved, bestUrl);
 
   await launchClaude(
-    serverUrl,
+    bestUrl,
     file.caPem,
     saved,
     claudeArgs,

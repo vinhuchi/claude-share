@@ -9,7 +9,7 @@ import * as p from "@clack/prompts";
 import { platform } from "@shared/platforms";
 import { apiFetch } from "./fetch";
 import { logger } from "./logger";
-import { clearActiveConnection, writeActiveConnection } from "./storage";
+import { buildProxyUrl, clearActiveConnection, writeActiveConnection } from "./storage";
 import type { SavedConnection, SharerAccount } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -224,10 +224,7 @@ export async function launchClaude(
   // Proxy URL keeps https:// — the TLS terminator on the sharer routes CONNECT
   // requests to the MITM proxy after decryption, so the outer connection is
   // encrypted and proxy credentials are never sent in cleartext over the network.
-  const parsedProxy = new URL(proxyUrl);
-  parsedProxy.username = encodeURIComponent(meta.proxyUser);
-  parsedProxy.password = encodeURIComponent(meta.proxyPass);
-  const httpProxyUrl = parsedProxy.toString();
+  const httpProxyUrl = buildProxyUrl(proxyUrl, meta.proxyUser, meta.proxyPass);
 
   const child = spawn("claude", claudeArgs, {
     stdio: "inherit",
