@@ -160,11 +160,20 @@ export async function createMitmProxy(
 
       ctx[CTX_LOG_ID] = logRequest(method, hostname, reqPath, "allowed");
 
-      // Resolve machineId from the socket (set during CONNECT)
+      // Resolve machineId: try WeakMap(socket→id) first, fall back to connectRequest header
       const reqSocket = ctx.clientToProxyRequest?.socket;
-      if (reqSocket) {
-        const mid = socketMachineId.get(reqSocket);
-        if (mid) ctx[CTX_MACHINE_ID] = mid;
+      const midFromSocket = reqSocket ? socketMachineId.get(reqSocket) : undefined;
+      if (midFromSocket) {
+        ctx[CTX_MACHINE_ID] = midFromSocket;
+      } else {
+        const connectAuth = ctx.connectRequest?.headers?.["proxy-authorization"] ?? "";
+        if (connectAuth) {
+          const session = getSession?.();
+          if (session) {
+            const mid = resolveMachineId(session, connectAuth);
+            if (mid) ctx[CTX_MACHINE_ID] = mid;
+          }
+        }
       }
 
       ctx.proxyToServerRequestOptions.headers =
