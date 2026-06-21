@@ -115,6 +115,7 @@ export async function launchClaude(
   },
   claudeArgs: string[] = [],
   sharerAccount: SharerAccount | null = null,
+  cwd?: string,
 ) {
   if (!(await checkClaudeInstalled())) {
     p.log.error("Claude Code is not installed or not in PATH.");
@@ -187,9 +188,10 @@ export async function launchClaude(
   parsedProxy.password = encodeURIComponent(meta.proxyPass);
   const httpProxyUrl = parsedProxy.toString();
 
-  const claudeCmd = process.platform === "win32" ? "claude.cmd" : "claude";
-  const child = spawn(claudeCmd, claudeArgs, {
+  const child = spawn("claude", claudeArgs, {
     stdio: "inherit",
+    shell: process.platform === "win32",
+    ...(cwd ? { cwd } : {}),
     env: {
       ...process.env,
       HTTPS_PROXY: httpProxyUrl,

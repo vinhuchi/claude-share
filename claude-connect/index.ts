@@ -60,9 +60,11 @@ args.forEach((a, i) => {
     if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
   }
   if (a.startsWith("--share=")) ownIdxs.add(i);
+  if (a.startsWith("--dir=")) ownIdxs.add(i);
 });
 
 const claudeArgs = args.filter((_, i) => !ownIdxs.has(i));
+const dirArg = args.find((a) => a.startsWith("--dir="))?.slice("--dir=".length).trim();
 const shareArg = args.find((a) => a.startsWith("--share="));
 
 pruneExpiredConnections();
@@ -93,7 +95,7 @@ if (!hasAgreedToTerms()) {
 if (args[0] === "--list" || args[0] === "-l") {
   await listFlow();
 } else if (args[0] === "--reconnect" || args[0] === "-r") {
-  await reconnectFlow(args[1], claudeArgs);
+  await reconnectFlow(args[1], claudeArgs, dirArg);
 } else if (shareArg) {
   const connectUrl = shareArg.slice("--share=".length).trim();
   const parsed = parseConnectUrl(connectUrl);
@@ -118,16 +120,17 @@ if (args[0] === "--list" || args[0] === "-l") {
         existing,
         claudeArgs,
         existing.sharerAccount ?? null,
+        dirArg,
       );
     } else {
       // Session changed, server restarted, or TLS cert rotated (sharer restart generates
       // a new CA, so the old caPem fails verification and health returns alive=false).
       // The user provided an explicit new URL, so always attempt fresh pairing — if the
       // sharer is truly offline, pairFlow will fail with a network error naturally.
-      await pairFlow(parsed, claudeArgs);
+      await pairFlow(parsed, claudeArgs, dirArg);
     }
   } else {
-    await pairFlow(parsed, claudeArgs);
+    await pairFlow(parsed, claudeArgs, dirArg);
   }
 } else {
   // No --share flag: check for active saved connections first
@@ -174,7 +177,7 @@ if (args[0] === "--list" || args[0] === "-l") {
         process.exit(0);
       }
       if (pick === "__new__") {
-        await pairFlow(undefined, claudeArgs);
+        await pairFlow(undefined, claudeArgs, dirArg);
       } else {
         const chosen = active.find((r) => r.conn.id === pick)!;
         await launchClaude(
@@ -183,12 +186,13 @@ if (args[0] === "--list" || args[0] === "-l") {
           chosen.conn,
           claudeArgs,
           chosen.conn.sharerAccount ?? null,
+          dirArg,
         );
       }
     } else {
-      await pairFlow(undefined, claudeArgs);
+      await pairFlow(undefined, claudeArgs, dirArg);
     }
   } else {
-    await pairFlow(undefined, claudeArgs);
+    await pairFlow(undefined, claudeArgs, dirArg);
   }
 }
