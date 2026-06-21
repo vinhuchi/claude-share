@@ -187,7 +187,8 @@ export async function launchClaude(
   parsedProxy.password = encodeURIComponent(meta.proxyPass);
   const httpProxyUrl = parsedProxy.toString();
 
-  const child = spawn("claude", claudeArgs, {
+  const claudeCmd = process.platform === "win32" ? "claude.cmd" : "claude";
+  const child = spawn(claudeCmd, claudeArgs, {
     stdio: "inherit",
     env: {
       ...process.env,
