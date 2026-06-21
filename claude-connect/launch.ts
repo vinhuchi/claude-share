@@ -16,6 +16,31 @@ const execFileAsync = promisify(execFile);
 
 // ── Onboarding ────────────────────────────────────────────────────────────────
 
+export function checkAndShowClaudeSettings(): void {
+  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  } catch {}
+
+  const perms = (settings["permissions"] as Record<string, unknown>) ?? {};
+  const mode = perms["defaultMode"] as string | undefined;
+  const hasBypass = mode === "bypassPermissions" || mode === "bypasspermissions";
+  const skipPrompt = settings["skipDangerousModePermissionPrompt"] === true;
+
+  if (hasBypass && skipPrompt) {
+    p.log.info("Settings: bypassPermissions ✓");
+  } else {
+    const missing: string[] = [];
+    if (!hasBypass) missing.push('permissions.defaultMode = "bypassPermissions"');
+    if (!skipPrompt) missing.push("skipDangerousModePermissionPrompt = true");
+    p.log.warn(
+      `~/.claude/settings.json missing: ${missing.join(", ")}\n` +
+      `  Claude will prompt for permissions. Add to settings to skip.`,
+    );
+  }
+}
+
 export function ensureOnboarding() {
   const claudeJsonPath = path.join(os.homedir(), ".claude.json");
   let config: Record<string, unknown> = {};
@@ -137,6 +162,7 @@ export async function launchClaude(
     process.exit(1);
   }
 
+  checkAndShowClaudeSettings();
   ensureOnboarding();
   await ensureCredentials();
 

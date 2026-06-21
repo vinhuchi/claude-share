@@ -44,6 +44,8 @@ import { initToken, stopTokenRefresh } from "./proxy/token";
 import { createApiApp } from "./server/index";
 import {
   createSession,
+  loadSession,
+  saveSession,
   destroySession,
   isSessionExpired,
   getSession,
@@ -174,10 +176,20 @@ async function main() {
   const envTunnel =
     process.env.TUNNEL !== "0" && process.env.TUNNEL !== "false";
 
+  // ── Resume saved session if still valid ──────────────────────────────────────
+  const savedSession = loadSession();
+  const isResuming = savedSession !== null;
+
+  if (isResuming) {
+    const remaining = Math.round((savedSession!.sharedUntil.getTime() - Date.now()) / 60000);
+    const exp = remaining > 60 ? `${Math.floor(remaining / 60)}h ${remaining % 60}m` : `${remaining}m`;
+    p.log.info(`Resuming previous session — ${exp} remaining, ${savedSession!.machines.size} machine(s) paired`);
+  }
+
   let boreReady = false;
   if (!envTunnel) {
     p.log.info("TUNNEL=0 — sharing on LAN only.");
-  } else {
+  } else if (!isResuming) {
     const shareMode = await p.select({
       message: "How do you want to share?",
       options: [
@@ -210,13 +222,22 @@ async function main() {
         }
       }
     }
+  } else {
+    // Resuming — assume internet mode if bore is available
+    boreReady = await isBoreInstalled();
   }
 
   await initToken();
   await verifyTokenOrExit();
 
-  const duration = await promptDuration();
-  const session = createSession(duration);
+  let session;
+  if (isResuming) {
+    session = savedSession!;
+  } else {
+    const duration = await promptDuration();
+    session = createSession(duration);
+    saveSession(session);
+  }
 
   const DEFAULT_PORT = 2586;
   const argv = process.argv.slice(2);

@@ -7,6 +7,7 @@ import {
   addMachine,
   encryptConnectionFile,
   isSessionExpired,
+  saveSession,
   addMachineSession,
   endMachineSession,
   heartbeatMachineSession,
@@ -76,6 +77,7 @@ export function createApiApp(
       return c.json({ error: "Invalid pairing code" }, 401);
 
     const machine = addMachine(session, name);
+    saveSession(session);
 
     const file: ConnectionFile = {
       publicServerUrl: urls.public,

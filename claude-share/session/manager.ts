@@ -1,10 +1,15 @@
 import crypto from "node:crypto";
 import { webcrypto } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 
 import { toBase58 } from "@shared/base58";
 import type { ConnectionFile, SharerAccount } from "@shared/types";
+
+const SESSION_CACHE = path.join(os.homedir(), ".claude-share", "session.json");
 
 function randomBytes(n: number): Uint8Array {
   return webcrypto.getRandomValues(new Uint8Array(n));
@@ -183,5 +188,65 @@ export function destroySession(): void {
   if (currentSession) {
     currentSession.key.fill(0);
     currentSession = null;
+  }
+}
+
+// ── Session persistence ────────────────────────────────────────────────────────
+
+export function saveSession(session: Session): void {
+  try {
+    fs.mkdirSync(path.dirname(SESSION_CACHE), { recursive: true });
+    const data = {
+      id: session.id,
+      key: Buffer.from(session.key).toString("hex"),
+      pairingCode: session.pairingCode,
+      pairingCodeUsed: session.pairingCodeUsed,
+      sharedUntil: session.sharedUntil.toISOString(),
+      createdAt: session.createdAt.toISOString(),
+      machines: [...session.machines.entries()].map(([id, m]) => ({
+        id,
+        name: m.name,
+        pairedAt: m.pairedAt.toISOString(),
+        proxyPass: m.proxyPass,
+      })),
+    };
+    fs.writeFileSync(SESSION_CACHE, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch {}
+}
+
+export function loadSession(): Session | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SESSION_CACHE, "utf8"));
+    const sharedUntil = new Date(raw.sharedUntil);
+    if (Date.now() >= sharedUntil.getTime()) return null; // expired
+
+    const key = Uint8Array.from(Buffer.from(raw.key, "hex"));
+    const machines = new Map<string, Machine>(
+      (raw.machines ?? []).map((m: { id: string; name: string; pairedAt: string; proxyPass: string }) => [
+        m.id,
+        {
+          id: m.id,
+          name: m.name,
+          pairedAt: new Date(m.pairedAt),
+          sessions: new Map(),
+          proxyPass: m.proxyPass,
+        } satisfies Machine,
+      ]),
+    );
+
+    currentSession = {
+      id: raw.id,
+      key,
+      pairingCode: raw.pairingCode,
+      pairingCodeUsed: raw.pairingCodeUsed ?? false,
+      sharedUntil,
+      machines,
+      status: machines.size > 0 ? "active" : "waiting",
+      createdAt: new Date(raw.createdAt),
+      pairingAttempts: new Map(),
+    };
+    return currentSession;
+  } catch {
+    return null;
   }
 }
