@@ -25,9 +25,13 @@ export interface Tunnel {
 // or null if bore is not found.
 async function getBorePath(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("which", ["bore"]);
+    const cmd = process.platform === "win32" ? "where" : "which";
+    const { stdout } = await execFileAsync(cmd, ["bore"]);
     const p = stdout.trim();
-    if (p) return p;
+    if (p) {
+      const lines = p.split(/\r?\n/);
+      return lines[0].trim();
+    }
   } catch {}
   try {
     await fs.promises.access(BORE_LOCAL_PATH, fs.constants.X_OK);

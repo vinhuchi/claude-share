@@ -8,7 +8,7 @@ const borePassword = process.env.BORE_PASSWORD || "";
 function build(entry: string, outfile: string, extraArgs: string[] = []) {
   const result = Bun.spawnSync(
     [
-      "bun", "build", entry,
+      process.execPath, "build", entry,
       "--outfile", outfile,
       "--target", "node",
       "--production",

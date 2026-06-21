@@ -194,8 +194,6 @@ export async function launchClaude(
       HTTPS_PROXY: httpProxyUrl,
       HTTP_PROXY: httpProxyUrl,
       NODE_EXTRA_CA_CERTS: tmpCert,
-      SSL_CERT_FILE: tmpCert,
-      CURL_CA_BUNDLE: tmpCert,
     },
   });
 
