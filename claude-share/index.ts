@@ -159,12 +159,17 @@ async function main() {
 
   await checkForUpdate();
 
+  let canSetRawMode = false;
+  if (typeof process.stdin.setRawMode === "function") {
+    try {
+      process.stdin.setRawMode(true);
+      process.stdin.setRawMode(false);
+      canSetRawMode = true;
+    } catch {}
+  }
+
   const isHeadless =
-    !process.stdin.isTTY ||
-    !process.stdout.isTTY ||
-    typeof process.stdin.setRawMode !== "function" ||
-    process.env.PM2_HOME !== undefined ||
-    process.env.pm_id !== undefined ||
+    !canSetRawMode ||
     process.argv.includes("--headless");
 
   p.intro("claude-share");
