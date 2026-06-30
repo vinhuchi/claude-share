@@ -240,8 +240,7 @@ export function App({
         <Text dimColor>:{localPort}</Text>
         {totalStats.requests > 0 && (
           <Text dimColor>
-            {fmtTokens(totalStats.inputTokens + totalStats.outputTokens)} tok
-            {" · "}{totalStats.requests} req
+            {fmtTokens(totalStats.inputTokens)} in · {fmtTokens(totalStats.outputTokens)} out · {fmtTokens(totalStats.cacheReadTokens)} cache read · {fmtTokens(totalStats.cacheWriteTokens)} cache write · {totalStats.requests} req
           </Text>
         )}
         {tunnelDown && (
@@ -325,7 +324,7 @@ export function App({
                   <Text dimColor>— {formatRelative(last)}</Text>
                   {mStats && mStats.requests > 0 && (
                     <Text dimColor>
-                      [{fmtTokens(mStats.inputTokens + mStats.outputTokens)} tok · {mStats.requests} req]
+                      [{fmtTokens(mStats.inputTokens)} in · {fmtTokens(mStats.outputTokens)} out · {fmtTokens(mStats.cacheReadTokens)} cr · {fmtTokens(mStats.cacheWriteTokens)} cw · {mStats.requests} req]
                     </Text>
                   )}
                 </Box>

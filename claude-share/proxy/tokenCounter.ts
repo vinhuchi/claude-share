@@ -2,6 +2,7 @@ export interface TokenStats {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheWriteTokens: number;
   requests: number;
 }
 
@@ -10,6 +11,7 @@ let globalTotal: TokenStats = {
   inputTokens: 0,
   outputTokens: 0,
   cacheReadTokens: 0,
+  cacheWriteTokens: 0,
   requests: 0,
 };
 
@@ -20,23 +22,27 @@ export function recordTokens(
   input: number,
   output: number,
   cacheRead = 0,
+  cacheWrite = 0,
 ): void {
   const prev = byMachine.get(machineId) ?? {
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
+    cacheWriteTokens: 0,
     requests: 0,
   };
   byMachine.set(machineId, {
     inputTokens: prev.inputTokens + input,
     outputTokens: prev.outputTokens + output,
     cacheReadTokens: prev.cacheReadTokens + cacheRead,
+    cacheWriteTokens: prev.cacheWriteTokens + cacheWrite,
     requests: prev.requests + 1,
   });
   globalTotal = {
     inputTokens: globalTotal.inputTokens + input,
     outputTokens: globalTotal.outputTokens + output,
     cacheReadTokens: globalTotal.cacheReadTokens + cacheRead,
+    cacheWriteTokens: globalTotal.cacheWriteTokens + cacheWrite,
     requests: globalTotal.requests + 1,
   };
   listeners.forEach((fn) => fn());
@@ -48,6 +54,7 @@ export function getMachineStats(machineId: string): TokenStats {
       inputTokens: 0,
       outputTokens: 0,
       cacheReadTokens: 0,
+      cacheWriteTokens: 0,
       requests: 0,
     }
   );

@@ -22,7 +22,7 @@ export async function reconnectFlow(
   let chosen: SavedConnection;
   let resolvedUrl: string;
 
-  if (uuid) {
+  if (uuid && !uuid.startsWith("-")) {
     const match = connections.find((c) => c.id.startsWith(uuid));
     if (!match) {
       p.log.error(`No connection matching ${uuid}`);

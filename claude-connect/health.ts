@@ -73,10 +73,6 @@ export async function resolveActiveUrl(
 
   const candidates: Array<{ url: string; timeout: number }> = [];
 
-  if (conn.lanServerUrl) {
-    candidates.push({ url: conn.lanServerUrl, timeout: 1_000 });
-  }
-
   if (conn.publicServerUrl) {
     candidates.push({ url: conn.publicServerUrl, timeout: 5_000 });
   }

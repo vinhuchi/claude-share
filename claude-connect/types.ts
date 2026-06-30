@@ -5,7 +5,6 @@ export type { ConnectionFile, SharerAccount } from "@shared/types";
 export interface SavedConnection {
   id: string;
   systemName: string;
-  lanServerUrl: string | null;
   publicServerUrl: string | null;
   sessionId: string;
   sharedUntil: string; // ISO-8601 — used to prune expired connections on startup

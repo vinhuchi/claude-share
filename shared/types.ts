@@ -7,7 +7,6 @@ export interface SharerAccount {
 // Wire format exchanged during pairing — produced by claude-share, consumed by claude-connect
 export interface ConnectionFile {
   publicServerUrl: string | null;
-  lanServerUrl: string | null;
   sessionId: string;
   sharedUntil: string; // ISO-8601
   caPem: string;

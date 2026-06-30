@@ -178,7 +178,7 @@ export function findConnectionByServerUrl(
   serverUrl: string,
 ): SavedConnection | null {
   const all = loadConnections().filter(
-    (c) => c.lanServerUrl === serverUrl || c.publicServerUrl === serverUrl,
+    (c) => c.publicServerUrl === serverUrl,
   );
   if (all.length === 0) return null;
   return all.sort(

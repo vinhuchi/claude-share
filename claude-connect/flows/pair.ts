@@ -138,7 +138,6 @@ export async function pairFlow(
   const saved: SavedConnection = {
     id: connectionId,
     systemName: file.systemName ?? serverHostname,
-    lanServerUrl: file.lanServerUrl,
     publicServerUrl: file.publicServerUrl,
     sessionId: file.sessionId,
     sharedUntil: file.sharedUntil,
@@ -153,7 +152,7 @@ export async function pairFlow(
   // Use the best available route for both the VS Code extension's
   // active-connection.json and the launched Claude proxy/session, matching
   // reconnect's "best route" semantics.
-  const bestUrl = file.publicServerUrl ?? file.lanServerUrl ?? serverUrl;
+  const bestUrl = file.publicServerUrl ?? serverUrl;
   writeActiveConnection(saved, bestUrl);
 
   await launchClaude(

@@ -9,10 +9,61 @@ import * as p from "@clack/prompts";
 import { platform } from "@shared/platforms";
 import { apiFetch } from "./fetch";
 import { logger } from "./logger";
-import { buildProxyUrl, clearActiveConnection, writeActiveConnection } from "./storage";
-import type { SavedConnection, SharerAccount } from "./types";
+import { buildProxyUrl, clearActiveConnection } from "./storage";
+import type { SharerAccount } from "./types";
 
 const execFileAsync = promisify(execFile);
+
+// ── Connect settings ──────────────────────────────────────────────────────────
+
+const DEFAULT_DENY_RULES = [
+  "Read(**/.env*)",
+  "Read(**/.git/**)",
+];
+
+function collectEnvFiles(dir: string, depth = 0, results: string[] = []): string[] {
+  if (depth > 5) return results;
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name !== "node_modules" && entry.name !== ".git") {
+        collectEnvFiles(path.join(dir, entry.name), depth + 1, results);
+      } else if (entry.isFile() && /^\.env($|\.)/.test(entry.name)) {
+        results.push(path.join(dir, entry.name).replace(/\\/g, "/"));
+      }
+    }
+  } catch {}
+  return results;
+}
+
+export function ensureConnectSettings(cwd?: string): string {
+  const connectDir = path.join(os.homedir(), ".claude-connect");
+  const settingsPath = path.join(connectDir, "settings.json");
+
+  if (!fs.existsSync(connectDir)) {
+    fs.mkdirSync(connectDir, { recursive: true, mode: 0o700 });
+  }
+
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  } catch {}
+
+  const perms = (settings["permissions"] as Record<string, unknown>) ?? {};
+  const deny = new Set<string>((perms["deny"] as string[]) ?? []);
+
+  for (const rule of DEFAULT_DENY_RULES) deny.add(rule);
+
+  if (cwd) {
+    for (const absPath of collectEnvFiles(cwd)) {
+      deny.add(`Read(${absPath})`);
+    }
+  }
+
+  settings["permissions"] = { ...perms, deny: [...deny] };
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+
+  return settingsPath;
+}
 
 // ── Onboarding ────────────────────────────────────────────────────────────────
 
@@ -92,26 +143,63 @@ const PLACEHOLDER_CREDENTIALS = {
 };
 
 export async function ensureCredentials() {
-  if (await platform().credentialsExist()) return;
+  let hasValidCreds = false;
+  try {
+    if (await platform().credentialsExist()) {
+      const creds = await platform().readOAuthCredentials();
+      if (creds && creds.accessToken) {
+        hasValidCreds = true;
+      }
+    }
+  } catch {}
 
-  p.log.warn(
-    "No Claude credentials found. Claude needs this to think you're logged in.",
-  );
-  const confirm = await p.confirm({
-    message:
-      "Create placeholder credentials so Claude launches without a login prompt?",
-    initialValue: true,
-  });
-  if (p.isCancel(confirm) || !confirm) {
-    p.log.warn("Skipping credentials setup. Claude may redirect you to login.");
-    return;
+  if (!hasValidCreds) {
+    p.log.warn("No valid Claude credentials found. Writing placeholder credentials...");
+    await platform().writeOAuthCredentials(PLACEHOLDER_CREDENTIALS);
+    p.log.success("Placeholder credentials created.");
   }
-
-  await platform().writeOAuthCredentials(PLACEHOLDER_CREDENTIALS);
-  p.log.success("Placeholder credentials created.");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Ask which permission mode to launch Claude in (Normal vs
+ * --dangerously-skip-permissions) and return the claude args accordingly.
+ *
+ * Lives here — not in index.ts — so EVERY launch path goes through it:
+ * --share=, pairing, reconnect, and the no-arg picker all funnel into
+ * launchClaude/launchClaudeReal, so the permission step is now consistent
+ * instead of only appearing in the no-arg "active sharer" branch.
+ *
+ * Skips the prompt when the user already opted out via `--skip-permissions`
+ * (claude-connect's own flag) or by passing `--dangerously-skip-permissions`
+ * through to Claude directly.
+ */
+export async function resolvePermissionArgs(claudeArgs: string[]): Promise<string[]> {
+  if (claudeArgs.includes("--dangerously-skip-permissions")) return claudeArgs;
+  if (process.argv.includes("--skip-permissions")) {
+    return ["--dangerously-skip-permissions", ...claudeArgs];
+  }
+
+  const mode = await p.select({
+    message: "Launch mode:",
+    options: [
+      { value: "normal", label: "Normal", hint: "standard permission prompts" },
+      {
+        value: "skip",
+        label: "Skip permissions",
+        hint: "--dangerously-skip-permissions",
+      },
+    ],
+  });
+  if (p.isCancel(mode)) {
+    p.cancel("Cancelled.");
+    process.exit(0);
+  }
+  return mode === "skip"
+    ? ["--dangerously-skip-permissions", ...claudeArgs]
+    : claudeArgs;
+}
 
 export async function checkClaudeInstalled(): Promise<boolean> {
   const which = process.platform === "win32" ? "where" : "which";
@@ -161,6 +249,12 @@ export async function launchClaude(
     p.log.info("Install it with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
   }
+
+  const connectSettingsPath = ensureConnectSettings(cwd);
+
+  // Ask permission mode before any side effects so the prompt is the first
+  // thing after picking a server, not buried behind session setup.
+  claudeArgs = await resolvePermissionArgs(claudeArgs);
 
   checkAndShowClaudeSettings();
   ensureOnboarding();
@@ -221,12 +315,9 @@ export async function launchClaude(
 
   const startTime = Date.now();
 
-  // Proxy URL keeps https:// — the TLS terminator on the sharer routes CONNECT
-  // requests to the MITM proxy after decryption, so the outer connection is
-  // encrypted and proxy credentials are never sent in cleartext over the network.
   const httpProxyUrl = buildProxyUrl(proxyUrl, meta.proxyUser, meta.proxyPass);
 
-  const child = spawn("claude", claudeArgs, {
+  const child = spawn("claude", ["--settings", connectSettingsPath, ...claudeArgs], {
     stdio: "inherit",
     shell: process.platform === "win32",
     ...(cwd ? { cwd } : {}),
@@ -300,6 +391,8 @@ export async function launchClaudeReal(
     p.log.info("Install it with: npm install -g @anthropic-ai/claude-code");
     process.exit(1);
   }
+
+  claudeArgs = await resolvePermissionArgs(claudeArgs);
 
   // Remove active-connection.json so VS Code extension patch doesn't inject proxy
   clearActiveConnection();

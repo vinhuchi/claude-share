@@ -141,6 +141,16 @@ async function promptDuration(): Promise<number> {
   return choice as number;
 }
 
+function parseDurationFlag(): number {
+  const arg = process.argv.find((a) => a.startsWith("--duration="));
+  if (!arg) return 24 * 60 * 60 * 1000;
+  const val = arg.slice("--duration=".length).trim().toLowerCase();
+  if (val.endsWith("h")) return parseInt(val, 10) * 60 * 60 * 1000;
+  if (val.endsWith("d")) return parseInt(val, 10) * 24 * 60 * 60 * 1000;
+  if (val.endsWith("m")) return parseInt(val, 10) * 60 * 1000;
+  return parseInt(val, 10) * 60 * 60 * 1000;
+}
+
 async function main() {
   if (process.argv.includes("--upgrade")) {
     await forceUpgrade();
@@ -149,9 +159,17 @@ async function main() {
 
   await checkForUpdate();
 
+  const isHeadless = !process.stdin.isTTY || process.argv.includes("--headless");
+
   p.intro("claude-share");
 
   if (!hasAgreedToTerms()) {
+    if (isHeadless) {
+      process.stderr.write(
+        "[claude-share] ERROR: Terms not yet agreed. Run interactively once first to accept terms.\n",
+      );
+      process.exit(1);
+    }
     p.log.warn(
       "Heads up: You're sharing your Claude Code at your own risk.\n" +
         "This is an open-source project and we are not liable for any damage or\n" +
@@ -190,24 +208,31 @@ async function main() {
   if (!envTunnel) {
     p.log.info("TUNNEL=0 — sharing on LAN only.");
   } else if (!isResuming) {
-    const shareMode = await p.select({
-      message: "How do you want to share?",
-      options: [
-        {
-          value: "internet",
-          label: "Internet",
-          hint: "EXPERIMENTAL: TCP tunnels via bore",
-        },
-        {
-          value: "lan",
-          label: "LAN only",
-          hint: "Both machines require to be on the same network",
-        },
-      ],
-    });
-    if (p.isCancel(shareMode)) {
-      p.cancel("Cancelled.");
-      process.exit(0);
+    let shareMode: string;
+    if (isHeadless) {
+      // In headless mode default to internet if bore is/can be installed
+      shareMode = "internet";
+    } else {
+      const choice = await p.select({
+        message: "How do you want to share?",
+        options: [
+          {
+            value: "internet",
+            label: "Internet",
+            hint: "EXPERIMENTAL: TCP tunnels via bore",
+          },
+          {
+            value: "lan",
+            label: "LAN only",
+            hint: "Both machines require to be on the same network",
+          },
+        ],
+      });
+      if (p.isCancel(choice)) {
+        p.cancel("Cancelled.");
+        process.exit(0);
+      }
+      shareMode = choice as string;
     }
 
     if (shareMode === "internet") {
@@ -234,7 +259,7 @@ async function main() {
   if (isResuming) {
     session = savedSession!;
   } else {
-    const duration = await promptDuration();
+    const duration = isHeadless ? parseDurationFlag() : await promptDuration();
     session = createSession(duration);
     saveSession(session);
   }
@@ -414,7 +439,7 @@ async function main() {
   let publicUrl: string | null = null;
   let tunnelDown = false;
   let tunnelStartedAt: Date | null = null;
-  let rerenderApp: ((node: React.ReactElement) => void) | null = null;
+  let rerenderApp: (() => void) | null = null;
 
   if (boreReady) {
     logger.info("Starting bore tunnel");
@@ -422,7 +447,7 @@ async function main() {
       tunnel = await startTunnel(PORT, () => {
         tunnelDown = true;
         logger.error("bore tunnel disconnected unexpectedly");
-        rerenderApp?.(makeAppElement());
+        rerenderApp?.();
       });
       publicUrl = tunnel.publicUrl;
       urls.public = publicUrl;
@@ -452,6 +477,57 @@ async function main() {
     destroySession();
   }
 
+  if (isHeadless) {
+    // ── Headless mode: no Ink TUI, log events to stdout ─────────────────────
+    const connectUrl = (base: string) =>
+      `claudeshare://${base.replace(/^https?:\/\//, "")}/connect/${session.pairingCode}`;
+
+    if (publicUrl) process.stdout.write(`[claude-share] Public:  ${connectUrl(publicUrl)}\n`);
+    if (lanUrl)    process.stdout.write(`[claude-share] LAN:     ${connectUrl(lanUrl)}\n`);
+    process.stdout.write(`[claude-share] Local:   ${connectUrl(loopbackUrl)}\n`);
+
+    const expiry = session.sharedUntil.toISOString();
+    process.stdout.write(`[claude-share] Sharing until ${expiry}\n`);
+    process.stdout.write(`[claude-share] Ready. Port ${PORT}\n`);
+
+    // Poll for machine changes and log them
+    let knownMachineIds = new Set<string>(session.machines.keys());
+    const poll = setInterval(() => {
+      const s = getSession();
+      if (!s) return;
+      const current = new Map(s.machines);
+      for (const [id, m] of current) {
+        if (!knownMachineIds.has(id)) {
+          process.stdout.write(`[claude-share] Machine connected: ${m.name} (${id.slice(0, 8)})\n`);
+          knownMachineIds.add(id);
+        }
+      }
+      for (const id of knownMachineIds) {
+        if (!current.has(id)) {
+          process.stdout.write(`[claude-share] Machine removed: ${id.slice(0, 8)}\n`);
+          knownMachineIds.delete(id);
+        }
+      }
+    }, 2000);
+    poll.unref();
+
+    process.on("SIGINT", () => { clearInterval(poll); cleanup(); process.exit(0); });
+    process.on("SIGTERM", () => { clearInterval(poll); cleanup(); process.exit(0); });
+
+    const expiryCheck = setInterval(() => {
+      if (isSessionExpired(session)) {
+        clearInterval(expiryCheck);
+        clearInterval(poll);
+        process.stdout.write("[claude-share] Session expired. Exiting.\n");
+        cleanup();
+        process.exit(0);
+      }
+    }, 60_000);
+    expiryCheck.unref();
+    return;
+  }
+
+  // ── Interactive TUI mode ─────────────────────────────────────────────────────
   function makeAppElement(): React.ReactElement {
     return React.createElement(App, {
       publicUrl,
@@ -470,7 +546,7 @@ async function main() {
   }
 
   const { unmount, rerender } = render(makeAppElement());
-  rerenderApp = rerender;
+  rerenderApp = () => rerender(makeAppElement());
 
   process.on("SIGINT", () => {
     unmount();

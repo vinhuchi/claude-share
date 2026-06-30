@@ -14,6 +14,8 @@ import { recordTokens } from "./tokenCounter";
 import { getAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
 
+const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const socketMachineId = new WeakMap<object, string>();
@@ -185,8 +187,29 @@ export async function createMitmProxy(
       ctx.proxyToServerRequestOptions.headers["authorization"] =
         `Bearer ${getAccessToken()}`;
 
+      delete ctx.proxyToServerRequestOptions.headers["x-api-key"];
       delete ctx.proxyToServerRequestOptions.headers["x-forwarded-for"];
       delete ctx.proxyToServerRequestOptions.headers["x-real-ip"];
+
+      // Redact emails in request body before forwarding to Anthropic
+      if (method === "POST" && hostname === "api.anthropic.com") {
+        delete ctx.proxyToServerRequestOptions.headers["content-length"];
+        ctx.proxyToServerRequestOptions.headers["transfer-encoding"] = "chunked";
+        const chunks: Buffer[] = [];
+        ctx.addRequestFilter(
+          new Transform({
+            transform(chunk, _enc, done) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              done();
+            },
+            flush(done) {
+              const body = Buffer.concat(chunks).toString("utf8");
+              this.push(Buffer.from(body.replace(EMAIL_RE, "[REDACTED]")));
+              done();
+            },
+          }),
+        );
+      }
 
       callback();
     });
@@ -273,10 +296,17 @@ export async function createMitmProxy(
                 return buf.toString("utf8");
               };
               const body = decode(raw);
-              const inp = parseInt(body.match(/"input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
-              const out = parseInt(body.match(/"output_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
-              const cache = parseInt(body.match(/"cache_read_input_tokens"\s*:\s*(\d+)/)?.[1] ?? "0", 10);
-              if (inp > 0 || out > 0) recordTokens(machineId!, inp, out, cache);
+              const inps = [...body.matchAll(/"input_tokens"\s*:\s*(\d+)/g)].map(m => m[1]);
+              const outs = [...body.matchAll(/"output_tokens"\s*:\s*(\d+)/g)].map(m => m[1]);
+              const caches = [...body.matchAll(/"cache_read_input_tokens"\s*:\s*(\d+)/g)].map(m => m[1]);
+              const cacheWrites = [...body.matchAll(/"cache_creation_input_tokens"\s*:\s*(\d+)/g)].map(m => m[1]);
+
+              const inp = inps.length > 0 ? parseInt(inps[inps.length - 1], 10) : 0;
+              const out = outs.length > 0 ? parseInt(outs[outs.length - 1], 10) : 0;
+              const cache = caches.length > 0 ? parseInt(caches[caches.length - 1], 10) : 0;
+              const cacheWrite = cacheWrites.length > 0 ? parseInt(cacheWrites[cacheWrites.length - 1], 10) : 0;
+
+              if (inp > 0 || out > 0) recordTokens(machineId!, inp, out, cache, cacheWrite);
               done();
             },
           }),

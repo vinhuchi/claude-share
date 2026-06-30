@@ -20,11 +20,13 @@ import { pairFlow } from "./flows/pair";
 import { reconnectFlow } from "./flows/reconnect";
 import { listFlow } from "./flows/list";
 import { cleanupFlow } from "./flows/cleanup";
+import { startLocalForwarder } from "./forwarder";
 import { resolveActiveUrl, resolveAnyActive } from "./health";
 import { launchClaude, launchClaudeReal } from "./launch";
 import { logger } from "./logger";
 import { parseConnectUrl } from "./pairing";
 import {
+  buildProxyUrl,
   findConnectionByServerUrl,
   hasAgreedToTerms,
   loadConnections,
@@ -57,6 +59,7 @@ args.forEach((a, i) => {
   if (a === "--list" || a === "-l") ownIdxs.add(i);
   if (a === "--cleanup") ownIdxs.add(i);
   if (a === "--real") ownIdxs.add(i);
+  if (a === "--proxy") ownIdxs.add(i);
   if (a === "--skip-permissions") ownIdxs.add(i);
   if (a === "--reconnect" || a === "-r") {
     ownIdxs.add(i);
@@ -65,34 +68,6 @@ args.forEach((a, i) => {
   if (a.startsWith("--share=")) ownIdxs.add(i);
   if (a.startsWith("--dir=")) ownIdxs.add(i);
 });
-
-async function askLaunchMode(currentArgs: string[]): Promise<string[]> {
-  // If already specified via flag, skip prompt
-  if (
-    args.includes("--skip-permissions") ||
-    currentArgs.includes("--dangerously-skip-permissions")
-  ) {
-    return ["--dangerously-skip-permissions", ...currentArgs];
-  }
-  const mode = await p.select({
-    message: "Launch mode:",
-    options: [
-      { value: "normal", label: "Normal", hint: "standard permission prompts" },
-      {
-        value: "skip",
-        label: "Skip permissions",
-        hint: "--dangerously-skip-permissions",
-      },
-    ],
-  });
-  if (p.isCancel(mode)) {
-    p.cancel("Cancelled.");
-    process.exit(0);
-  }
-  return mode === "skip"
-    ? ["--dangerously-skip-permissions", ...currentArgs]
-    : currentArgs;
-}
 
 const claudeArgs = args.filter((_, i) => !ownIdxs.has(i));
 const dirArg = args.find((a) => a.startsWith("--dir="))?.slice("--dir=".length).trim();
@@ -128,7 +103,31 @@ if (!hasAgreedToTerms()) {
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-if (args[0] === "--list" || args[0] === "-l") {
+if (args.includes("--proxy")) {
+  p.intro("claude-connect — proxy mode");
+
+  const saved = loadConnections();
+  const active = await resolveAnyActive(saved);
+
+  if (!active) {
+    p.log.error("No active sharer found. Pair first with: claude-connect --share=<url>");
+    process.exit(1);
+  }
+
+  p.log.info(`Using ${active.conn.systemName}'s share (${active.url})`);
+
+  const proxyUrl = buildProxyUrl(active.url, active.conn.proxyUser, active.conn.proxyPass);
+  const { port, close } = await startLocalForwarder(proxyUrl, active.conn.caPem);
+
+  p.log.success(`Forwarder running — set in Open Design or any app:`);
+  p.log.info(`ANTHROPIC_BASE_URL=http://127.0.0.1:${port}`);
+  p.outro("Press Ctrl+C to stop.");
+
+  process.on("SIGINT", () => { close(); process.exit(0); });
+  process.on("SIGTERM", () => { close(); process.exit(0); });
+
+  await new Promise(() => {}); // keep alive
+} else if (args[0] === "--list" || args[0] === "-l") {
   await listFlow();
 } else if (args.includes("--real")) {
   await launchClaudeReal(claudeArgs, dirArg);
@@ -220,18 +219,18 @@ if (args[0] === "--list" || args[0] === "-l") {
         process.exit(0);
       }
       if (pick === "__real__") {
-        const finalArgs = await askLaunchMode(claudeArgs);
-        await launchClaudeReal(finalArgs, dirArg);
+        // Permission mode is now asked inside launchClaudeReal so every path
+        // (--share, pair, reconnect, picker) prompts consistently.
+        await launchClaudeReal(claudeArgs, dirArg);
       } else if (pick === "__new__") {
         await pairFlow(undefined, claudeArgs, dirArg);
       } else {
         const chosen = active.find((r) => r.conn.id === pick)!;
-        const finalArgs = await askLaunchMode(claudeArgs);
         await launchClaude(
           chosen.url,
           chosen.conn.caPem,
           chosen.conn,
-          finalArgs,
+          claudeArgs,
           chosen.conn.sharerAccount ?? null,
           dirArg,
         );
