@@ -565,23 +565,51 @@ export function createApiApp(
     );
   });
 
+  const failedLogins = new Map<string, { count: number; blockedUntil: number }>();
+
   // Helper middleware to check dashboard authorization (via pairing code)
   const dashboardAuth = async (c: any, next: () => Promise<void>) => {
+    const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+    const now = Date.now();
+
+    // Check if blocked
+    const record = failedLogins.get(ip);
+    if (record && record.blockedUntil > now) {
+      const remainingSecs = Math.ceil((record.blockedUntil - now) / 1000);
+      return c.text(`Too many failed attempts. Blocked for another ${remainingSecs} seconds.`, 429);
+    }
+
     const session = getSession();
     if (!session || isSessionExpired(session)) {
       return c.text("Session expired", 401);
     }
+
     const code = c.req.header("x-pairing-code");
-    if (!code || code !== session.pairingCode) {
+    const adminPass = process.env.DASHBOARD_PASSWORD;
+    const isValid = (code && code === session.pairingCode) || (adminPass && code === adminPass);
+
+    if (!isValid) {
+      // Record failure
+      const current = failedLogins.get(ip) ?? { count: 0, blockedUntil: 0 };
+      current.count += 1;
+      if (current.count >= 5) {
+        current.blockedUntil = now + 15 * 60 * 1000; // 15 mins block
+        current.count = 0; // reset counter after blocking
+      }
+      failedLogins.set(ip, current);
+
       return c.text("Unauthorized", 401);
     }
+
+    // Success - reset attempts
+    failedLogins.delete(ip);
     return next();
   };
 
   /** GET /api/dashboard/stats — returns data for the web UI */
   app.get("/api/dashboard/stats", dashboardAuth, (c) => {
     const session = getSession()!;
-    const localPort = urls.lan ? parseInt(new URL(urls.lan).port || "2586", 10) : 2586;
+    const localPort = urls.lan ? parseInt(new URL(urls.lan).port || "25866", 10) : 25866;
 
     const machines = [...session.machines.values()].map((m) => {
       const stats = getMachineStats(m.id);

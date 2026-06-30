@@ -159,7 +159,13 @@ async function main() {
 
   await checkForUpdate();
 
-  const isHeadless = !process.stdin.isTTY || process.argv.includes("--headless");
+  const isHeadless =
+    !process.stdin.isTTY ||
+    !process.stdout.isTTY ||
+    typeof process.stdin.setRawMode !== "function" ||
+    process.env.PM2_HOME !== undefined ||
+    process.env.pm_id !== undefined ||
+    process.argv.includes("--headless");
 
   p.intro("claude-share");
 
@@ -264,7 +270,7 @@ async function main() {
     saveSession(session);
   }
 
-  const DEFAULT_PORT = 2586;
+  const DEFAULT_PORT = 25866;
   const argv = process.argv.slice(2);
   const portIdx = argv.findIndex((a) => a === "--port" || a === "-p");
   const portEq = argv.find(
