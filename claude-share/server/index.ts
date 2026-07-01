@@ -525,7 +525,7 @@ export function createApiApp(
                         const colorClass = isError ? 'text-red-400' : 'text-green-400';
                         statusBadge = '<span class="' + colorClass + '">' + l.status + '</span>';
                         if (l.errorLogFile) {
-                            statusBadge += ' <button onclick="viewErrorDetails(\'' + l.errorLogFile + '\')" class="px-1.5 py-0.5 rounded text-[10px] font-semibold text-red-400 bg-red-950/20 border border-red-900/30 hover:bg-red-950/40 transition">Details</button>';
+                            statusBadge += ' <button onclick="viewErrorDetails(' + "'" + l.errorLogFile + "'" + ')" class="px-1.5 py-0.5 rounded text-[10px] font-semibold text-red-400 bg-red-950/20 border border-red-900/30 hover:bg-red-950/40 transition">Details</button>';
                         }
                     }
                     
@@ -572,7 +572,7 @@ export function createApiApp(
                         '<span class="font-semibold text-red-400">Bad Request (400)</span>' +
                         '<span class="text-zinc-500 text-[10px]">' + time + ' (' + sizeKB + ')</span>' +
                         '</div>' +
-                        '<button onclick="viewErrorDetails(\'' + log.filename + '\')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>';
+                        '<button onclick="viewErrorDetails(' + "'" + log.filename + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>';
                     container.appendChild(div);
                 });
             } catch (err) {
@@ -670,7 +670,7 @@ export function createApiApp(
                             '<span class="text-zinc-500 text-xs">' + m.stats.requests + ' req</span>' +
                             '</td>' +
                             '<td class="py-3 px-4 text-right">' +
-                            '<button onclick="revokeMachine(\'' + m.id + '\')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>' +
+                            '<button onclick="revokeMachine(' + "'" + m.id + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>' +
                             '</td>';
                         mBody.appendChild(tr);
                     });
