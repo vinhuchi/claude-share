@@ -371,7 +371,37 @@ export function createApiApp(
                     <!-- Logs populated here -->
                 </div>
             </div>
+
+            <!-- API 400 Error History -->
+            <div id="error-logs-section" class="hidden glass-panel rounded-2xl overflow-hidden border-l-red-500 border-l-2">
+                <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                    <div class="flex items-center gap-2">
+                        <h3 class="text-base font-semibold text-zinc-200">API 400 Error History</h3>
+                        <span class="px-2 py-0.5 text-[10px] font-bold bg-red-950/20 text-red-400 border border-red-900/30 rounded-md">Error Logger</span>
+                    </div>
+                    <button onclick="loadErrorLogsList()" class="text-xs text-cyan-400 font-semibold hover:text-cyan-300">Refresh</button>
+                </div>
+                <div class="p-4 bg-zinc-950/50 max-h-48 overflow-y-auto space-y-2 text-xs" id="error-logs-list-container">
+                    <!-- List of 400 error logs -->
+                </div>
+            </div>
         </main>
+    </div>
+
+    <!-- Error Details Modal -->
+    <div id="error-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
+        <div class="glass-panel w-full max-w-4xl max-h-[85vh] flex flex-col rounded-2xl overflow-hidden shadow-2xl">
+            <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                <h3 class="text-base font-semibold text-zinc-200">API Error Log Details</h3>
+                <button onclick="closeErrorModal()" class="text-zinc-400 hover:text-zinc-200 text-lg font-bold">&times;</button>
+            </div>
+            <div class="p-6 overflow-y-auto font-mono text-xs space-y-4 bg-zinc-950 select-all" id="error-modal-content" style="white-space: pre-wrap; word-break: break-all;">
+                <!-- Log content here -->
+            </div>
+            <div class="px-6 py-4 border-t border-zinc-800 flex justify-end bg-zinc-900/10">
+                <button onclick="closeErrorModal()" class="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-xs font-semibold text-zinc-300 rounded-lg transition">Close</button>
+            </div>
+        </div>
     </div>
 
     <!-- Scripts -->
@@ -399,7 +429,7 @@ export function createApiApp(
             }
         }
 
-        async function apiCall(endpoint, method = 'GET', body = null) {
+        async function apiCall(endpoint, method = 'GET', body = null, isText = false) {
             const headers = {
                 'x-pairing-code': getPairingCode(),
             };
@@ -419,7 +449,7 @@ export function createApiApp(
                 const txt = await res.text();
                 throw new Error(txt || 'API Error');
             }
-            return res.json();
+            return isText ? res.text() : res.json();
         }
 
         async function handleLogin(e) {
@@ -514,6 +544,54 @@ export function createApiApp(
             }
         }
 
+        async function loadErrorLogsList() {
+            try {
+                const data = await apiCall('/api/dashboard/error-logs');
+                const container = el('error-logs-list-container');
+                const section = el('error-logs-section');
+                
+                if (data.logs.length === 0) {
+                    section.classList.add('hidden');
+                    return;
+                }
+                
+                section.classList.remove('hidden');
+                container.innerHTML = '';
+                
+                data.logs.forEach(log => {
+                    const time = new Date(log.createdAt).toLocaleString();
+                    const sizeKB = (log.size / 1024).toFixed(1) + ' KB';
+                    
+                    const div = document.createElement('div');
+                    div.className = 'flex items-center justify-between p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg hover:border-zinc-700 transition';
+                    div.innerHTML = \`
+                        <div class="flex flex-col">
+                            <span class="font-semibold text-red-400">Bad Request (400)</span>
+                            <span class="text-zinc-500 text-[10px]">\${time} (\${sizeKB})</span>
+                        </div>
+                        <button onclick="viewErrorDetails('\${log.filename}')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>
+                    \`;
+                    container.appendChild(div);
+                });
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        async function viewErrorDetails(filename) {
+            try {
+                const content = await apiCall('/api/dashboard/error-logs/' + filename, 'GET', null, true);
+                el('error-modal-content').innerText = content;
+                el('error-modal').classList.remove('hidden');
+            } catch (err) {
+                alert('Failed to load error log: ' + err.message);
+            }
+        }
+
+        function closeErrorModal() {
+            el('error-modal').classList.add('hidden');
+        }
+
         async function loadStats() {
             try {
                 const data = await apiCall('/api/dashboard/stats');
@@ -600,6 +678,8 @@ export function createApiApp(
                 
                 // Fetch logs as well
                 await loadLogs();
+                // Fetch error logs list
+                await loadErrorLogsList();
             } catch (err) {
                 console.error(err);
             }
@@ -765,6 +845,44 @@ export function createApiApp(
       logs = logs.filter((l) => l.machineId === machineId);
     }
     return c.json({ logs });
+  });
+
+  /** GET /api/dashboard/error-logs — list recent API 400 error logs */
+  app.get("/api/dashboard/error-logs", dashboardAuth, (c) => {
+    const logDir = path.join(os.homedir(), ".claude-share", "logs");
+    try {
+      if (!fs.existsSync(logDir)) return c.json({ logs: [] });
+      const files = fs.readdirSync(logDir)
+        .filter((f) => f.startsWith("api-error-400-") && f.endsWith(".log"))
+        .map((f) => {
+          const stats = fs.statSync(path.join(logDir, f));
+          return {
+            filename: f,
+            createdAt: stats.mtime.toISOString(),
+            size: stats.size,
+          };
+        })
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      return c.json({ logs: files });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  /** GET /api/dashboard/error-logs/:filename — read specific API 400 error log */
+  app.get("/api/dashboard/error-logs/:filename", dashboardAuth, (c) => {
+    const filename = c.req.param("filename");
+    if (!filename.startsWith("api-error-400-") || !filename.endsWith(".log") || filename.includes("..") || filename.includes("/")) {
+      return c.text("Invalid filename", 400);
+    }
+    const logPath = path.join(os.homedir(), ".claude-share", "logs", filename);
+    try {
+      if (!fs.existsSync(logPath)) return c.text("File not found", 404);
+      const content = fs.readFileSync(logPath, "utf8");
+      return c.text(content);
+    } catch (err) {
+      return c.text(String(err), 500);
+    }
   });
 
   /** POST /api/dashboard/regenerate — regenerates pairing code via web UI */
