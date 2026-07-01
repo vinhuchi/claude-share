@@ -359,6 +359,8 @@ async function main() {
           mitmProxy.handleSocket(tlsSocket);
         } else {
           const upstream = net.connect(API_PORT, "127.0.0.1");
+          tlsSocket.setNoDelay(true);
+          upstream.setNoDelay(true);
           tlsSocket.pipe(upstream);
           upstream.pipe(tlsSocket);
           upstream.on("error", () => tlsSocket.destroy());
@@ -385,6 +387,8 @@ async function main() {
     },
     onTls: (socket) => {
       const upstream = net.connect(TLS_TERM_PORT, "127.0.0.1");
+      socket.setNoDelay(true);
+      upstream.setNoDelay(true);
       socket.pipe(upstream);
       upstream.pipe(socket);
       socket.on("error", () => upstream.destroy());

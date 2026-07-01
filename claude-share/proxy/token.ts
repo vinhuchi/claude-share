@@ -11,7 +11,9 @@ function spawnClaudeForRefresh(): Promise<void> {
   return new Promise((resolve, reject) => {
     // Run 'claude -p HI' to trigger Claude CLI's internal OAuth refresh flow.
     // This is headless and updates the system keychain/credentials.
-    const child = execFile("claude", ["-p", "HI"], { timeout: 60_000 }, (err) => {
+    // Windows npm installs "claude" as a .cmd shim — execFile can't exec that
+    // without a shell (unlike claude-connect/launch.ts's spawn, which already sets this).
+    const child = execFile("claude", ["-p", "HI"], { timeout: 60_000, shell: process.platform === "win32" }, (err) => {
       if (err?.killed) {
         reject(new Error("Claude process timed out after 60s"));
       } else {

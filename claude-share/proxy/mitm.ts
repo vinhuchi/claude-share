@@ -54,6 +54,9 @@ const API_ALLOWED_PATHS: Array<{ method: string | null; prefix: string }> = [
   { method: null, prefix: "/api/hello" },
   { method: "POST", prefix: "/v1/messages" },
   { method: "GET", prefix: "/v1/models" },
+  // WebFetch preflight domain-reputation check — blocking it makes Claude Code
+  // report "Unable to verify if domain X is safe to fetch" for every WebFetch.
+  { method: "GET", prefix: "/api/web/domain_info" },
 ];
 
 // api.anthropic.com paths that are always blocked regardless of method
@@ -120,10 +123,17 @@ export async function createMitmProxy(
 
     // The library calls console.error() before invoking onError handlers, so we
     // patch _onError directly to suppress benign keep-alive teardowns at the source.
+    // Only swallow when no client is actually waiting on a response — otherwise a
+    // stale keep-alive socket to api.anthropic.com getting reset (a normal race once
+    // keepAlive is on) would silently drop the client's request instead of the library's
+    // usual fallback of replying 504, leaving the client hanging forever.
     const _origOnError = (proxy as any)._onError.bind(proxy);
     (proxy as any)._onError = (kind: string, ctx: any, err: Error) => {
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === "ECONNRESET" || code === "HPE_INVALID_EOF_STATE") return;
+      const isBenign = code === "ECONNRESET" || code === "HPE_INVALID_EOF_STATE";
+      const clientAwaitingResponse =
+        ctx?.proxyToClientResponse && !ctx.proxyToClientResponse.headersSent;
+      if (isBenign && !clientAwaitingResponse) return;
       _origOnError(kind, ctx, err);
     };
 
@@ -415,7 +425,9 @@ export async function createMitmProxy(
         // Non-Anthropic domain: transparent TCP tunnel — no cert, no decryption.
         // The client's TLS handshake goes straight to the real server.
         const port = parseInt(portStr, 10) || 443;
+        socket.setNoDelay(true);
         const upstream = net.connect(port, hostname, () => {
+          upstream.setNoDelay(true);
           socket.write("HTTP/1.1 200 Connection established\r\n\r\n");
           if (head?.length) upstream.write(head);
           upstream.pipe(socket);
@@ -426,9 +438,11 @@ export async function createMitmProxy(
       },
     );
 
-    // Listen on a random localhost port — CA generation completes before callback fires
+    // Listen on a random localhost port — CA generation completes before callback fires.
+    // keepAlive reuses the TLS connection to api.anthropic.com across requests instead of
+    // renegotiating a fresh handshake every message (http-mitm-proxy defaults this to false).
     proxy.listen(
-      { port: 0, host: "127.0.0.1", sslCaDir },
+      { port: 0, host: "127.0.0.1", sslCaDir, keepAlive: true },
       (err?: Error | null) => {
         if (err) return reject(err);
 
@@ -474,6 +488,8 @@ export async function createMitmProxy(
 
     function pipeToProxy(socket: net.Socket) {
       const upstream = net.connect(proxyPort, "127.0.0.1");
+      socket.setNoDelay(true);
+      upstream.setNoDelay(true);
       socket.pipe(upstream);
       upstream.pipe(socket);
       socket.on("error", () => upstream.destroy());
