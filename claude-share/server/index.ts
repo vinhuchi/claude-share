@@ -456,6 +456,16 @@ export function createApiApp(
             return ((inp * 3 + out * 15 + cr * 0.3 + cw * 3.75) / 1000000).toFixed(2);
         }
 
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.toString()
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
         let statsInterval = null;
         window.machinesMap = {};
 
@@ -490,9 +500,9 @@ export function createApiApp(
                     logLine.className = 'flex flex-wrap items-center gap-x-2 text-zinc-300 py-0.5 border-b border-zinc-900/30';
                     logLine.innerHTML = \`
                         <span class="text-zinc-500 font-normal">\${time}</span>
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-zinc-900 text-zinc-400 border border-zinc-800">\${machineName}</span>
+                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-zinc-900 text-zinc-400 border border-zinc-800">\${escapeHtml(machineName)}</span>
                         <span class="font-semibold text-zinc-200">\${l.method}</span>
-                        <span class="text-zinc-400 flex-1 truncate select-all">\${pathText}</span>
+                        <span class="text-zinc-400 flex-1 truncate select-all">\${escapeHtml(pathText)}</span>
                         <span class="text-[10px] uppercase font-semibold \${outcomeColor}">\${l.outcome}</span>
                         <span>·</span>
                         \${statusBadge}
@@ -568,9 +578,9 @@ export function createApiApp(
                         tr.innerHTML = \`
                             <td class="py-3 px-4 font-semibold flex items-center gap-2">
                                 <span class="w-2 h-2 rounded-full \${active ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}"></span>
-                                \${m.name}
+                                \${escapeHtml(m.name)}
                             </td>
-                            <td class="py-3 px-4 text-zinc-400 text-sm font-mono">\ \${m.id.slice(0, 8)}</td>
+                            <td class="py-3 px-4 text-zinc-400 text-sm font-mono"> \${m.id.slice(0, 8)}</td>
                             <td class="py-3 px-4 text-zinc-400 text-sm">
                                 \${fmtTokens(m.stats.inputTokens)} in · \${fmtTokens(m.stats.outputTokens)} out<br/>
                                 <span class="text-zinc-500 text-xs">\${fmtTokens(m.stats.cacheReadTokens)} cr · \${fmtTokens(m.stats.cacheWriteTokens)} cw</span>
@@ -652,13 +662,22 @@ export function createApiApp(
   });
 
   const failedLogins = new Map<string, { count: number; blockedUntil: number }>();
+  let globalBlockTime = 0;
+  let globalFailCount = 0;
+  let globalResetTime = 0;
 
   // Helper middleware to check dashboard authorization (via pairing code)
   const dashboardAuth = async (c: any, next: () => Promise<void>) => {
     const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
     const now = Date.now();
 
-    // Check if blocked
+    // Check if globally blocked
+    if (globalBlockTime > now) {
+      const remainingSecs = Math.ceil((globalBlockTime - now) / 1000);
+      return c.text(`Too many failed attempts globally. Blocked for another ${remainingSecs} seconds.`, 429);
+    }
+
+    // Check if IP blocked
     const record = failedLogins.get(ip);
     if (record && record.blockedUntil > now) {
       const remainingSecs = Math.ceil((record.blockedUntil - now) / 1000);
@@ -675,14 +694,25 @@ export function createApiApp(
     const isValid = (code && code === session.pairingCode) || (adminPass && code === adminPass);
 
     if (!isValid) {
-      // Record failure
+      // 1. Record IP failure
       const current = failedLogins.get(ip) ?? { count: 0, blockedUntil: 0 };
       current.count += 1;
       if (current.count >= 5) {
         current.blockedUntil = now + 15 * 60 * 1000; // 15 mins block
-        current.count = 0; // reset counter after blocking
+        current.count = 0;
       }
       failedLogins.set(ip, current);
+
+      // 2. Record Global failure
+      if (globalResetTime < now) {
+        globalFailCount = 0;
+        globalResetTime = now + 5 * 60 * 1000; // 5 mins reset window
+      }
+      globalFailCount += 1;
+      if (globalFailCount >= 15) {
+        globalBlockTime = now + 15 * 60 * 1000; // 15 mins global block
+        globalFailCount = 0;
+      }
 
       return c.text("Unauthorized", 401);
     }

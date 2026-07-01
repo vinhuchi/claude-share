@@ -30,6 +30,13 @@ export interface Machine {
   pairedAt: Date;
   sessions: Map<string, MachineSession>;
   proxyPass: string;
+  stats: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    requests: number;
+  };
 }
 
 export type { ConnectionFile, SharerAccount } from "@shared/types";
@@ -119,6 +126,13 @@ export function addMachine(session: Session, name: string): Machine {
     pairedAt: new Date(),
     sessions: new Map(),
     proxyPass: Buffer.from(randomBytes(16)).toString("hex"),
+    stats: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      requests: 0,
+    },
   };
   session.machines.set(machine.id, machine);
   session.pairingCodeUsed = true;
@@ -219,6 +233,7 @@ export function saveSession(session: Session): void {
         name: m.name,
         pairedAt: m.pairedAt.toISOString(),
         proxyPass: m.proxyPass,
+        stats: m.stats,
       })),
     };
     fs.writeFileSync(SESSION_CACHE, JSON.stringify(data, null, 2), { mode: 0o600 });
@@ -233,7 +248,7 @@ export function loadSession(): Session | null {
 
     const key = Uint8Array.from(Buffer.from(raw.key, "hex"));
     const machines = new Map<string, Machine>(
-      (raw.machines ?? []).map((m: { id: string; name: string; pairedAt: string; proxyPass: string }) => [
+      (raw.machines ?? []).map((m: { id: string; name: string; pairedAt: string; proxyPass: string; stats?: any }) => [
         m.id,
         {
           id: m.id,
@@ -241,6 +256,13 @@ export function loadSession(): Session | null {
           pairedAt: new Date(m.pairedAt),
           sessions: new Map(),
           proxyPass: m.proxyPass,
+          stats: m.stats ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            requests: 0,
+          },
         } satisfies Machine,
       ]),
     );

@@ -1,3 +1,5 @@
+import { getSession, saveSession } from "../session/manager";
+
 export interface TokenStats {
   inputTokens: number;
   outputTokens: number;
@@ -5,15 +7,6 @@ export interface TokenStats {
   cacheWriteTokens: number;
   requests: number;
 }
-
-const byMachine = new Map<string, TokenStats>();
-let globalTotal: TokenStats = {
-  inputTokens: 0,
-  outputTokens: 0,
-  cacheReadTokens: 0,
-  cacheWriteTokens: 0,
-  requests: 0,
-};
 
 const listeners = new Set<() => void>();
 
@@ -24,44 +17,56 @@ export function recordTokens(
   cacheRead = 0,
   cacheWrite = 0,
 ): void {
-  const prev = byMachine.get(machineId) ?? {
+  const session = getSession();
+  if (!session) return;
+
+  const machine = session.machines.get(machineId);
+  if (!machine) return;
+
+  machine.stats = {
+    inputTokens: machine.stats.inputTokens + input,
+    outputTokens: machine.stats.outputTokens + output,
+    cacheReadTokens: machine.stats.cacheReadTokens + cacheRead,
+    cacheWriteTokens: machine.stats.cacheWriteTokens + cacheWrite,
+    requests: machine.stats.requests + 1,
+  };
+
+  saveSession(session);
+  listeners.forEach((fn) => fn());
+}
+
+export function getMachineStats(machineId: string): TokenStats {
+  const session = getSession();
+  if (!session) {
+    return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, requests: 0 };
+  }
+  const machine = session.machines.get(machineId);
+  if (!machine) {
+    return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, requests: 0 };
+  }
+  return { ...machine.stats };
+}
+
+export function getTotalStats(): TokenStats {
+  const session = getSession();
+  if (!session) {
+    return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, requests: 0 };
+  }
+  const total: TokenStats = {
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     requests: 0,
   };
-  byMachine.set(machineId, {
-    inputTokens: prev.inputTokens + input,
-    outputTokens: prev.outputTokens + output,
-    cacheReadTokens: prev.cacheReadTokens + cacheRead,
-    cacheWriteTokens: prev.cacheWriteTokens + cacheWrite,
-    requests: prev.requests + 1,
-  });
-  globalTotal = {
-    inputTokens: globalTotal.inputTokens + input,
-    outputTokens: globalTotal.outputTokens + output,
-    cacheReadTokens: globalTotal.cacheReadTokens + cacheRead,
-    cacheWriteTokens: globalTotal.cacheWriteTokens + cacheWrite,
-    requests: globalTotal.requests + 1,
-  };
-  listeners.forEach((fn) => fn());
-}
-
-export function getMachineStats(machineId: string): TokenStats {
-  return (
-    byMachine.get(machineId) ?? {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      requests: 0,
-    }
-  );
-}
-
-export function getTotalStats(): TokenStats {
-  return { ...globalTotal };
+  for (const m of session.machines.values()) {
+    total.inputTokens += m.stats.inputTokens;
+    total.outputTokens += m.stats.outputTokens;
+    total.cacheReadTokens += m.stats.cacheReadTokens;
+    total.cacheWriteTokens += m.stats.cacheWriteTokens;
+    total.requests += m.stats.requests;
+  }
+  return total;
 }
 
 export function subscribeTokens(fn: () => void): () => void {
