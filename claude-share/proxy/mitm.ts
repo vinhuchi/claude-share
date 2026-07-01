@@ -16,6 +16,23 @@ import { resolveMachineId } from "../session/manager";
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
+function redactEmails(obj: any): any {
+  if (typeof obj === "string") {
+    return obj.replace(EMAIL_RE, "[REDACTED]");
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(redactEmails);
+  }
+  if (obj && typeof obj === "object") {
+    const res: any = {};
+    for (const key of Object.keys(obj)) {
+      res[key] = redactEmails(obj[key]);
+    }
+    return res;
+  }
+  return obj;
+}
+
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const CTX_REQUEST_BODY = Symbol("requestBody");
@@ -206,7 +223,15 @@ export async function createMitmProxy(
             },
             flush(done) {
               const body = Buffer.concat(chunks).toString("utf8");
-              const redacted = body.replace(EMAIL_RE, "[REDACTED]");
+              let redacted = body;
+              try {
+                const parsed = JSON.parse(body);
+                const redactedObj = redactEmails(parsed);
+                redacted = JSON.stringify(redactedObj);
+              } catch (err) {
+                // Fallback to regex replace if body is not valid JSON
+                redacted = body.replace(EMAIL_RE, "[REDACTED]");
+              }
               ctx[CTX_REQUEST_BODY] = redacted;
               this.push(Buffer.from(redacted));
               done();
