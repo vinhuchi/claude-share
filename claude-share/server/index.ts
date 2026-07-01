@@ -19,6 +19,7 @@ import {
 } from "../session/manager";
 
 import { getTotalStats, getMachineStats } from "../proxy/tokenCounter";
+import { getEntries } from "../proxy/requestLog";
 
 interface Urls {
   public: string | null;
@@ -351,6 +352,25 @@ export function createApiApp(
                     </table>
                 </div>
             </div>
+
+            <!-- Live Request Logs -->
+            <div class="glass-panel rounded-2xl overflow-hidden">
+                <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                    <div class="flex items-center gap-3">
+                        <h3 class="text-base font-semibold text-zinc-200">Live Request Log</h3>
+                        <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-zinc-500">Filter:</span>
+                        <select id="log-filter-device" onchange="loadLogs()" class="bg-zinc-900 border border-zinc-800 text-xs text-zinc-300 rounded-lg px-2.5 py-1 focus:outline-none focus:border-cyan-500">
+                            <option value="">All Devices</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="p-4 bg-zinc-950 font-mono text-xs max-h-60 overflow-y-auto space-y-1.5" id="logs-container" style="max-height: 250px;">
+                    <!-- Logs populated here -->
+                </div>
+            </div>
         </main>
     </div>
 
@@ -373,7 +393,9 @@ export function createApiApp(
             el('auth-view').classList.add('hidden');
             el('dashboard-view').classList.remove('hidden');
             if (!statsInterval) {
-                statsInterval = setInterval(loadStats, 3000);
+                statsInterval = setInterval(async () => {
+                    await loadStats();
+                }, 3000);
             }
         }
 
@@ -435,6 +457,52 @@ export function createApiApp(
         }
 
         let statsInterval = null;
+        window.machinesMap = {};
+
+        async function loadLogs() {
+            try {
+                const machineId = el('log-filter-device').value;
+                const url = '/api/dashboard/logs' + (machineId ? '?machineId=' + machineId : '');
+                const data = await apiCall(url);
+                
+                const logsContainer = el('logs-container');
+                logsContainer.innerHTML = '';
+                if (data.logs.length === 0) {
+                    logsContainer.innerHTML = \`<span class="text-zinc-600 italic">No request logs recorded yet.</span>\`;
+                    return;
+                }
+                
+                data.logs.forEach(l => {
+                    const time = new Date(l.ts).toLocaleTimeString();
+                    const machineName = l.machineId ? (window.machinesMap[l.machineId] || l.machineId.slice(0, 8)) : 'System';
+                    
+                    let statusBadge = '<span class="text-zinc-500">pending...</span>';
+                    if (l.status !== null) {
+                        const isError = l.status >= 400;
+                        const colorClass = isError ? 'text-red-400' : 'text-green-400';
+                        statusBadge = \`<span class="\${colorClass}">\${l.status}</span>\`;
+                    }
+                    
+                    const outcomeColor = l.outcome === 'allowed' ? 'text-cyan-500' : 'text-red-500';
+                    const pathText = l.path;
+                    
+                    const logLine = document.createElement('div');
+                    logLine.className = 'flex flex-wrap items-center gap-x-2 text-zinc-300 py-0.5 border-b border-zinc-900/30';
+                    logLine.innerHTML = \`
+                        <span class="text-zinc-500 font-normal">\${time}</span>
+                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-zinc-900 text-zinc-400 border border-zinc-800">\${machineName}</span>
+                        <span class="font-semibold text-zinc-200">\${l.method}</span>
+                        <span class="text-zinc-400 flex-1 truncate select-all">\${pathText}</span>
+                        <span class="text-[10px] uppercase font-semibold \${outcomeColor}">\${l.outcome}</span>
+                        <span>·</span>
+                        \${statusBadge}
+                    \`;
+                    logsContainer.appendChild(logLine);
+                });
+            } catch (err) {
+                console.error(err);
+            }
+        }
 
         async function loadStats() {
             try {
@@ -471,6 +539,12 @@ export function createApiApp(
                     tunnelStatusEl.className = 'text-yellow-400 font-semibold';
                 }
 
+                // Update machines map
+                window.machinesMap = {};
+                const filterSelect = el('log-filter-device');
+                const selectedVal = filterSelect.value;
+                filterSelect.innerHTML = '<option value="">All Devices</option>';
+
                 // Render machines
                 const mBody = el('machines-tbody');
                 mBody.innerHTML = '';
@@ -478,6 +552,14 @@ export function createApiApp(
                     mBody.innerHTML = \`<tr><td colspan="5" class="py-6 text-center text-zinc-500">No connected devices yet.</td></tr>\`;
                 } else {
                     data.machines.forEach(m => {
+                        window.machinesMap[m.id] = m.name;
+                        
+                        // Populate filter dropdown
+                        const opt = document.createElement('option');
+                        opt.value = m.id;
+                        opt.innerText = m.name;
+                        filterSelect.appendChild(opt);
+
                         const active = m.sessions.some(s => s.active);
                         const cost = calcCost(m.stats.inputTokens, m.stats.outputTokens, m.stats.cacheReadTokens, m.stats.cacheWriteTokens);
                         
@@ -488,7 +570,7 @@ export function createApiApp(
                                 <span class="w-2 h-2 rounded-full \${active ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}"></span>
                                 \${m.name}
                             </td>
-                            <td class="py-3 px-4 text-zinc-400 text-sm font-mono">\${m.id.slice(0, 8)}</td>
+                            <td class="py-3 px-4 text-zinc-400 text-sm font-mono">\ \${m.id.slice(0, 8)}</td>
                             <td class="py-3 px-4 text-zinc-400 text-sm">
                                 \${fmtTokens(m.stats.inputTokens)} in · \${fmtTokens(m.stats.outputTokens)} out<br/>
                                 <span class="text-zinc-500 text-xs">\${fmtTokens(m.stats.cacheReadTokens)} cr · \${fmtTokens(m.stats.cacheWriteTokens)} cw</span>
@@ -504,6 +586,10 @@ export function createApiApp(
                         mBody.appendChild(tr);
                     });
                 }
+                filterSelect.value = selectedVal;
+                
+                // Fetch logs as well
+                await loadLogs();
             } catch (err) {
                 console.error(err);
             }
@@ -639,6 +725,16 @@ export function createApiApp(
       totalStats,
       machines,
     });
+  });
+
+  /** GET /api/dashboard/logs — returns recent request logs */
+  app.get("/api/dashboard/logs", dashboardAuth, (c) => {
+    const machineId = c.req.query("machineId");
+    let logs = getEntries();
+    if (machineId) {
+      logs = logs.filter((l) => l.machineId === machineId);
+    }
+    return c.json({ logs });
   });
 
   /** POST /api/dashboard/regenerate — regenerates pairing code via web UI */

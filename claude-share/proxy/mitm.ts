@@ -18,6 +18,7 @@ const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
+const CTX_REQUEST_BODY = Symbol("requestBody");
 const socketMachineId = new WeakMap<object, string>();
 
 // Domains the proxy intercepts and forwards to Anthropic with injected token
@@ -164,23 +165,24 @@ export async function createMitmProxy(
         return;
       }
 
-      ctx[CTX_LOG_ID] = logRequest(method, hostname, reqPath, "allowed");
-
       // Resolve machineId: try WeakMap(socket→id) first, fall back to connectRequest header
       const reqSocket = ctx.clientToProxyRequest?.socket;
-      const midFromSocket = reqSocket ? socketMachineId.get(reqSocket) : undefined;
-      if (midFromSocket) {
-        ctx[CTX_MACHINE_ID] = midFromSocket;
-      } else {
+      let machineId: string | undefined = reqSocket ? socketMachineId.get(reqSocket) : undefined;
+      if (!machineId) {
         const connectAuth = ctx.connectRequest?.headers?.["proxy-authorization"] ?? "";
         if (connectAuth) {
           const session = getSession?.();
           if (session) {
-            const mid = resolveMachineId(session, connectAuth);
-            if (mid) ctx[CTX_MACHINE_ID] = mid;
+            machineId = resolveMachineId(session, connectAuth) ?? undefined;
           }
         }
       }
+
+      if (machineId) {
+        ctx[CTX_MACHINE_ID] = machineId;
+      }
+
+      ctx[CTX_LOG_ID] = logRequest(method, hostname, reqPath, "allowed", machineId);
 
       ctx.proxyToServerRequestOptions.headers =
         ctx.proxyToServerRequestOptions.headers ?? {};
@@ -204,7 +206,9 @@ export async function createMitmProxy(
             },
             flush(done) {
               const body = Buffer.concat(chunks).toString("utf8");
-              this.push(Buffer.from(body.replace(EMAIL_RE, "[REDACTED]")));
+              const redacted = body.replace(EMAIL_RE, "[REDACTED]");
+              ctx[CTX_REQUEST_BODY] = redacted;
+              this.push(Buffer.from(redacted));
               done();
             },
           }),
@@ -251,6 +255,43 @@ export async function createMitmProxy(
             },
             flush(done) {
               this.push(body);
+              done();
+            },
+          }),
+        );
+      }
+
+      if (status === 400 && host === "api.anthropic.com") {
+        const resChunks: Buffer[] = [];
+        ctx.addResponseFilter(
+          new Transform({
+            transform(chunk, _enc, done) {
+              resChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              this.push(chunk);
+              done();
+            },
+            flush(done) {
+              const resBody = Buffer.concat(resChunks).toString("utf8");
+              const reqBody = ctx[CTX_REQUEST_BODY] ?? "(not captured)";
+              
+              const logDir = path.join(os.homedir(), ".claude-share", "logs");
+              try {
+                fs.mkdirSync(logDir, { recursive: true });
+                const logPath = path.join(logDir, `api-error-400-${Date.now()}.log`);
+                const logContent = [
+                  `TIMESTAMP: ${new Date().toISOString()}`,
+                  `PATH: ${ctx.clientToProxyRequest?.url ?? ""}`,
+                  `RESPONSE STATUS: 400`,
+                  `RESPONSE BODY:\n${resBody}\n`,
+                  `REQUEST BODY (FIRST 5000 CHARS):\n${reqBody.slice(0, 5000)}\n`,
+                  `REQUEST BODY (FULL):\n${reqBody}`
+                ].join("\n\n");
+                
+                fs.writeFileSync(logPath, logContent, "utf8");
+                logger.error(`[mitm] API 400 Error. Logged request/response to ${logPath}`);
+              } catch (logErr) {
+                logger.error("[mitm] failed to write API 400 error log", logErr);
+              }
               done();
             },
           }),

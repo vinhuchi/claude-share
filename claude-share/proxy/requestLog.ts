@@ -9,6 +9,7 @@ export interface RequestEntry {
   outcome: RequestOutcome;
   /** HTTP status returned to client (set after response) */
   status: number | null;
+  machineId?: string;
 }
 
 const MAX_ENTRIES = 200;
@@ -21,9 +22,10 @@ export function logRequest(
   hostname: string,
   path: string,
   outcome: RequestOutcome,
+  machineId?: string,
 ): number {
   const id = ++seq;
-  entries.unshift({ id, ts: new Date(), method, hostname, path, outcome, status: null });
+  entries.unshift({ id, ts: new Date(), method, hostname, path, outcome, status: null, machineId });
   if (entries.length > MAX_ENTRIES) entries.pop();
   listeners.forEach((fn) => fn());
   return id;
