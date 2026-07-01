@@ -521,6 +521,9 @@ export function createApiApp(
                         const isError = l.status >= 400;
                         const colorClass = isError ? 'text-red-400' : 'text-green-400';
                         statusBadge = \`<span class="\${colorClass}">\${l.status}</span>\`;
+                        if (l.errorLogFile) {
+                            statusBadge += \` <button onclick="viewErrorDetails('\${l.errorLogFile}')" class="px-1.5 py-0.5 rounded text-[10px] font-semibold text-red-400 bg-red-950/20 border border-red-900/30 hover:bg-red-950/40 transition">Details</button>\`;
+                        }
                     }
                     
                     const outcomeColor = l.outcome === 'allowed' ? 'text-cyan-500' : 'text-red-500';

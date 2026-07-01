@@ -10,6 +10,7 @@ export interface RequestEntry {
   /** HTTP status returned to client (set after response) */
   status: number | null;
   machineId?: string;
+  errorLogFile?: string;
 }
 
 const MAX_ENTRIES = 200;
@@ -35,6 +36,14 @@ export function setResponseStatus(id: number, status: number): void {
   const entry = entries.find((e) => e.id === id);
   if (entry) {
     entry.status = status;
+    listeners.forEach((fn) => fn());
+  }
+}
+
+export function setErrorLogFile(id: number, filename: string): void {
+  const entry = entries.find((e) => e.id === id);
+  if (entry) {
+    entry.errorLogFile = filename;
     listeners.forEach((fn) => fn());
   }
 }

@@ -9,7 +9,7 @@ import { Proxy } from "http-mitm-proxy";
 
 import { generateServerCert, type ServerCert } from "../ca/serverCert";
 import { logger } from "../logger";
-import { logRequest, setResponseStatus } from "./requestLog";
+import { logRequest, setResponseStatus, setErrorLogFile } from "./requestLog";
 import { recordTokens } from "./tokenCounter";
 import { getAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
@@ -277,7 +277,8 @@ export async function createMitmProxy(
               const logDir = path.join(os.homedir(), ".claude-share", "logs");
               try {
                 fs.mkdirSync(logDir, { recursive: true });
-                const logPath = path.join(logDir, `api-error-400-${Date.now()}.log`);
+                const logFilename = `api-error-400-${Date.now()}.log`;
+                const logPath = path.join(logDir, logFilename);
                 const logContent = [
                   `TIMESTAMP: ${new Date().toISOString()}`,
                   `PATH: ${ctx.clientToProxyRequest?.url ?? ""}`,
@@ -288,6 +289,9 @@ export async function createMitmProxy(
                 ].join("\n\n");
                 
                 fs.writeFileSync(logPath, logContent, "utf8");
+                if (logId !== undefined) {
+                  setErrorLogFile(logId, logFilename);
+                }
                 logger.error(`[mitm] API 400 Error. Logged request/response to ${logPath}`);
               } catch (logErr) {
                 logger.error("[mitm] failed to write API 400 error log", logErr);
