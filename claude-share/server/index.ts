@@ -511,7 +511,7 @@ export function createApiApp(
                 const logsContainer = el('logs-container');
                 logsContainer.innerHTML = '';
                 if (data.logs.length === 0) {
-                    logsContainer.innerHTML = \`<span class="text-zinc-600 italic">No request logs recorded yet.</span>\`;
+                    logsContainer.innerHTML = '<span class="text-zinc-600 italic">No request logs recorded yet.</span>';
                     return;
                 }
                 
@@ -523,9 +523,9 @@ export function createApiApp(
                     if (l.status !== null) {
                         const isError = l.status >= 400;
                         const colorClass = isError ? 'text-red-400' : 'text-green-400';
-                        statusBadge = \`<span class="\${colorClass}">\${l.status}</span>\`;
+                        statusBadge = '<span class="' + colorClass + '">' + l.status + '</span>';
                         if (l.errorLogFile) {
-                            statusBadge += \` <button onclick="viewErrorDetails('\${l.errorLogFile}')" class="px-1.5 py-0.5 rounded text-[10px] font-semibold text-red-400 bg-red-950/20 border border-red-900/30 hover:bg-red-950/40 transition">Details</button>\`;
+                            statusBadge += ' <button onclick="viewErrorDetails(\'' + l.errorLogFile + '\')" class="px-1.5 py-0.5 rounded text-[10px] font-semibold text-red-400 bg-red-950/20 border border-red-900/30 hover:bg-red-950/40 transition">Details</button>';
                         }
                     }
                     
@@ -534,15 +534,13 @@ export function createApiApp(
                     
                     const logLine = document.createElement('div');
                     logLine.className = 'flex flex-wrap items-center gap-x-2 text-zinc-300 py-0.5 border-b border-zinc-900/30';
-                    logLine.innerHTML = \`
-                        <span class="text-zinc-500 font-normal">\${time}</span>
-                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-zinc-900 text-zinc-400 border border-zinc-800">\${escapeHtml(machineName)}</span>
-                        <span class="font-semibold text-zinc-200">\${l.method}</span>
-                        <span class="text-zinc-400 flex-1 truncate select-all">\${escapeHtml(pathText)}</span>
-                        <span class="text-[10px] uppercase font-semibold \${outcomeColor}">\${l.outcome}</span>
-                        <span>·</span>
-                        \${statusBadge}
-                    \`;
+                    logLine.innerHTML = '<span class="text-zinc-500 font-normal">' + time + '</span>' +
+                        '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-zinc-900 text-zinc-400 border border-zinc-800">' + escapeHtml(machineName) + '</span>' +
+                        '<span class="font-semibold text-zinc-200">' + l.method + '</span>' +
+                        '<span class="text-zinc-400 flex-1 truncate select-all">' + escapeHtml(pathText) + '</span>' +
+                        '<span class="text-[10px] uppercase font-semibold ' + outcomeColor + '">' + l.outcome + '</span>' +
+                        '<span>·</span>' +
+                        statusBadge;
                     logsContainer.appendChild(logLine);
                 });
             } catch (err) {
@@ -570,13 +568,11 @@ export function createApiApp(
                     
                     const div = document.createElement('div');
                     div.className = 'flex items-center justify-between p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg hover:border-zinc-700 transition';
-                    div.innerHTML = \`
-                        <div class="flex flex-col">
-                            <span class="font-semibold text-red-400">Bad Request (400)</span>
-                            <span class="text-zinc-500 text-[10px]">\${time} (\${sizeKB})</span>
-                        </div>
-                        <button onclick="viewErrorDetails('\${log.filename}')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>
-                    \`;
+                    div.innerHTML = '<div class="flex flex-col">' +
+                        '<span class="font-semibold text-red-400">Bad Request (400)</span>' +
+                        '<span class="text-zinc-500 text-[10px]">' + time + ' (' + sizeKB + ')</span>' +
+                        '</div>' +
+                        '<button onclick="viewErrorDetails(\'' + log.filename + '\')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>';
                     container.appendChild(div);
                 });
             } catch (err) {
@@ -659,24 +655,23 @@ export function createApiApp(
                         
                         const tr = document.createElement('tr');
                         tr.className = 'border-b border-zinc-800 hover:bg-zinc-900/30 transition';
-                        tr.innerHTML = \`
-                            <td class="py-3 px-4 font-semibold flex items-center gap-2">
-                                <span class="w-2 h-2 rounded-full \${active ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}"></span>
-                                \${escapeHtml(m.name)}
-                            </td>
-                            <td class="py-3 px-4 text-zinc-400 text-sm font-mono"> \${m.id.slice(0, 8)}</td>
-                            <td class="py-3 px-4 text-zinc-400 text-sm">
-                                \${fmtTokens(m.stats.inputTokens)} in · \${fmtTokens(m.stats.outputTokens)} out<br/>
-                                <span class="text-zinc-500 text-xs">\${fmtTokens(m.stats.cacheReadTokens)} cr · \${fmtTokens(m.stats.cacheWriteTokens)} cw</span>
-                            </td>
-                            <td class="py-3 px-4 text-sm">
-                                <span class="font-semibold">\$\${cost}</span><br/>
-                                <span class="text-zinc-500 text-xs">\${m.stats.requests} req</span>
-                            </td>
-                            <td class="py-3 px-4 text-right">
-                                <button onclick="revokeMachine('\${m.id}')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>
-                            </td>
-                        \`;
+                        const statusColor = active ? 'bg-green-500 animate-pulse' : 'bg-yellow-500';
+                        tr.innerHTML = '<td class="py-3 px-4 font-semibold flex items-center gap-2">' +
+                            '<span class="w-2 h-2 rounded-full ' + statusColor + '"></span>' +
+                            escapeHtml(m.name) +
+                            '</td>' +
+                            '<td class="py-3 px-4 text-zinc-400 text-sm font-mono"> ' + m.id.slice(0, 8) + '</td>' +
+                            '<td class="py-3 px-4 text-zinc-400 text-sm">' +
+                            fmtTokens(m.stats.inputTokens) + ' in · ' + fmtTokens(m.stats.outputTokens) + ' out<br/>' +
+                            '<span class="text-zinc-500 text-xs">' + fmtTokens(m.stats.cacheReadTokens) + ' cr · ' + fmtTokens(m.stats.cacheWriteTokens) + ' cw</span>' +
+                            '</td>' +
+                            '<td class="py-3 px-4 text-sm">' +
+                            '<span class="font-semibold">$' + cost + '</span><br/>' +
+                            '<span class="text-zinc-500 text-xs">' + m.stats.requests + ' req</span>' +
+                            '</td>' +
+                            '<td class="py-3 px-4 text-right">' +
+                            '<button onclick="revokeMachine(\'' + m.id + '\')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>' +
+                            '</td>';
                         mBody.appendChild(tr);
                     });
                 }
