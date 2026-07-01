@@ -482,7 +482,7 @@ export function createApiApp(
             const h = Math.floor(ms / 3600000);
             const m = Math.floor((ms % 3600000) / 60000);
             const s = Math.floor((ms % 60000) / 1000);
-            return \`\${h}h \${m}m \${s}s\`;
+            return h + 'h ' + m + 'm ' + s + 's';
         }
 
         function calcCost(inp, out, cr, cw) {
@@ -605,10 +605,10 @@ export function createApiApp(
                 
                 // Render pairing link
                 const bestUrl = data.publicUrl || data.lanUrl || 'http://localhost:' + data.localPort;
-                const connectUrl = 'claudeshare://' + bestUrl.replace(/^https?:\\/\\//, '') + '/connect/' + data.pairingCode;
+                const connectUrl = 'claudeshare://' + bestUrl.replace('https://', '').replace('http://', '') + '/connect/' + data.pairingCode;
                 el('pairing-link-text').value = connectUrl;
                 el('pairing-code-text').value = data.pairingCode;
-                el('connect-cmd-text').value = \`claude-connect --share "\${connectUrl}"\`;
+                el('connect-cmd-text').value = 'claude-connect --share "' + connectUrl + '"';
                 
                 // Render token stats
                 const ts = data.totalStats;
@@ -639,7 +639,7 @@ export function createApiApp(
                 const mBody = el('machines-tbody');
                 mBody.innerHTML = '';
                 if (data.machines.length === 0) {
-                    mBody.innerHTML = \`<tr><td colspan="5" class="py-6 text-center text-zinc-500">No connected devices yet.</td></tr>\`;
+                    mBody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-zinc-500">No connected devices yet.</td></tr>';
                 } else {
                     data.machines.forEach(m => {
                         window.machinesMap[m.id] = m.name;
