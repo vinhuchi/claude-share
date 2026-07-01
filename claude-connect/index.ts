@@ -4,6 +4,7 @@ import * as p from "@clack/prompts";
 
 import { platform } from "@shared/platforms";
 import { checkForUpdate, forceUpgrade } from "@shared/checkVersion";
+import { resetTerminalModes } from "@shared/terminal";
 import pkg from "../package.json";
 
 if (process.argv.includes("-v") || process.argv.includes("--version")) {
@@ -44,11 +45,7 @@ process.on("unhandledRejection", (reason) => {
   process.exit(1);
 });
 
-process.on("exit", () => {
-  try {
-    process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?25h");
-  } catch {}
-});
+process.on("exit", resetTerminalModes);
 
 // Exits with a clear error if the platform is unsupported
 platform();

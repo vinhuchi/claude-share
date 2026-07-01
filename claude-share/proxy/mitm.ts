@@ -54,6 +54,12 @@ const API_ALLOWED_PATHS: Array<{ method: string | null; prefix: string }> = [
   { method: null, prefix: "/api/hello" },
   { method: "POST", prefix: "/v1/messages" },
   { method: "GET", prefix: "/v1/models" },
+  // OAuth account profile — Claude Code fetches this to learn the account's
+  // entitlements (e.g. Fable/Mythos access). Blocking it makes Claude Code
+  // fall back to "no entitlement", so gated models like claude-fable-5 read as
+  // "not available for your account" even when the sharer's account has them.
+  { method: "GET", prefix: "/api/oauth/profile" },
+  { method: "GET", prefix: "/api/claude_cli_profile" },
   // WebFetch preflight domain-reputation check — blocking it makes Claude Code
   // report "Unable to verify if domain X is safe to fetch" for every WebFetch.
   { method: "GET", prefix: "/api/web/domain_info" },

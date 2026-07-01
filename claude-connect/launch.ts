@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import * as p from "@clack/prompts";
 
 import { platform } from "@shared/platforms";
+import { resetTerminalModes } from "@shared/terminal";
 import { apiFetch } from "./fetch";
 import { logger } from "./logger";
 import { buildProxyUrl, clearActiveConnection } from "./storage";
@@ -330,6 +331,10 @@ export async function launchClaude(
   });
 
   async function cleanupAndExit(code: number | null) {
+    // Do this first — the network call below can take up to 5s, and until
+    // this runs, leftover mouse-tracking modes spam the terminal on every
+    // mouse move.
+    resetTerminalModes();
     if (heartbeat) clearInterval(heartbeat);
     if (sessionId) {
       await sessionPost(
@@ -355,6 +360,7 @@ export async function launchClaude(
   });
 
   child.on("error", (err) => {
+    resetTerminalModes();
     logger.error("Failed to launch claude process", err);
     p.log.error(`Failed to launch claude: ${err.message}`);
     p.log.warn(
@@ -376,8 +382,17 @@ export async function launchClaude(
     process.exit(1);
   });
 
-  process.on("SIGINT", () => child.kill("SIGINT"));
-  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  // On Windows, child.kill() is always a hard TerminateProcess — the child's
+  // own ink cleanup never runs — so disable mouse tracking here ourselves
+  // before the child even dies, instead of waiting for its exit event.
+  process.on("SIGINT", () => {
+    resetTerminalModes();
+    child.kill("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    resetTerminalModes();
+    child.kill("SIGTERM");
+  });
 }
 
 // ── Real mode (own account, no proxy) ─────────────────────────────────────────
@@ -416,6 +431,7 @@ export async function launchClaudeReal(
   });
 
   child.on("exit", (code) => {
+    resetTerminalModes();
     const duration = Math.floor((Date.now() - startTime) / 1000);
     const mins = Math.floor(duration / 60);
     const secs = duration % 60;
@@ -424,11 +440,18 @@ export async function launchClaudeReal(
   });
 
   child.on("error", (err) => {
+    resetTerminalModes();
     logger.error("Failed to launch claude process", err);
     p.log.error(`Failed to launch claude: ${err.message}`);
     process.exit(1);
   });
 
-  process.on("SIGINT", () => child.kill("SIGINT"));
-  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  process.on("SIGINT", () => {
+    resetTerminalModes();
+    child.kill("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    resetTerminalModes();
+    child.kill("SIGTERM");
+  });
 }
