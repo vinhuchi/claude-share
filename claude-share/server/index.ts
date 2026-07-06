@@ -991,8 +991,14 @@ export function createApiApp(
             }
         }
 
+        let lastLiveUsageLoad = 0;
         async function loadUsage() {
-            await loadLiveUsage();
+            // Live plan usage hits Anthropic (rate-limited) — refresh at most
+            // every 5 minutes; the server also caches it for the same window.
+            if (Date.now() - lastLiveUsageLoad > 300000) {
+                lastLiveUsageLoad = Date.now();
+                loadLiveUsage();
+            }
             try {
                 const data = await apiCall('/api/dashboard/usage');
                 const mc = el('usage-models-container');
@@ -1281,7 +1287,16 @@ export function createApiApp(
    * same data Claude Code's own `/usage` shows (session 5h, weekly, per-model
    * incl. Fable). Fetched live from Anthropic with the sharer's token.
    */
+  // /api/oauth/usage is rate-limited (429 if hit too often), so cache the
+  // result for 5 minutes. Every dashboard poll reads this cache; Anthropic is
+  // called at most once per window. On error we serve the last good value.
+  let usageCache: { at: number; payload: { usage: unknown } } | null = null;
+  const USAGE_TTL = 5 * 60 * 1000;
+
   app.get("/api/dashboard/live-usage", dashboardAuth, async (c) => {
+    if (usageCache && Date.now() - usageCache.at < USAGE_TTL) {
+      return c.json({ ...usageCache.payload, cachedAgeMs: Date.now() - usageCache.at });
+    }
     try {
       const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
         headers: {
@@ -1291,10 +1306,13 @@ export function createApiApp(
         },
       });
       if (!res.ok) {
+        if (usageCache) return c.json({ ...usageCache.payload, stale: true });
         return c.json({ error: `Anthropic returned HTTP ${res.status}` });
       }
-      return c.json({ usage: await res.json() });
+      usageCache = { at: Date.now(), payload: { usage: await res.json() } };
+      return c.json(usageCache.payload);
     } catch (err) {
+      if (usageCache) return c.json({ ...usageCache.payload, stale: true });
       return c.json({ error: String(err) });
     }
   });
