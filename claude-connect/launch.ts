@@ -121,6 +121,23 @@ export function applySharerAccount(sharerAccount: { emailAddress: string; displa
   config["userEmail"] = sharerAccount.emailAddress;
   config["organizationName"] = sharerAccount.organizationName;
 
+  // Claude Code caches the account profile (entitlements) and the model-picker
+  // options keyed to whatever account it last saw. On the receiver that's their
+  // OWN account, so gated models (e.g. claude-fable-5) stay cached as
+  // "disabled"/"not available for your account" even though every request is
+  // proxied through the sharer's token. Drop those caches so Claude Code
+  // re-fetches them fresh over the proxy — mirroring a fresh install, which is
+  // why a never-used-locally machine (e.g. Linux) sees the sharer's models but
+  // a machine that ran its own account first does not.
+  for (const k of [
+    "oauthAccount",
+    "additionalModelOptionsCache",
+    "additionalModelCostsCache",
+    "modelAccessCache",
+  ]) {
+    delete config[k];
+  }
+
   fs.writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
@@ -318,9 +335,19 @@ export async function launchClaude(
 
   const httpProxyUrl = buildProxyUrl(proxyUrl, meta.proxyUser, meta.proxyPass);
 
-  const child = spawn("claude", ["--settings", connectSettingsPath, ...claudeArgs], {
+  // On Windows we spawn through the shell (so `claude`/`claude.cmd` resolves),
+  // but cmd.exe then splits unquoted args on spaces — so a home dir like
+  // "C:\Users\Duy Tran" turns `--settings C:\Users\Duy Tran\...` into a broken
+  // `--settings C:\Users\Duy` ("Settings file not found"). Quote args that
+  // contain whitespace when going through the shell.
+  const useShell = process.platform === "win32";
+  const shellQuote = (a: string) =>
+    useShell && /\s/.test(a) && !a.startsWith('"') ? `"${a}"` : a;
+  const spawnArgs = ["--settings", connectSettingsPath, ...claudeArgs].map(shellQuote);
+
+  const child = spawn("claude", spawnArgs, {
     stdio: "inherit",
-    shell: process.platform === "win32",
+    shell: useShell,
     ...(cwd ? { cwd } : {}),
     env: {
       ...process.env,
