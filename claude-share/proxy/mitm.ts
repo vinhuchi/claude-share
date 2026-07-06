@@ -272,6 +272,65 @@ export async function createMitmProxy(
       const host = (ctx.clientToProxyRequest?.headers?.host ?? "").split(
         ":",
       )[0];
+
+      // Log EVERY Anthropic error response (>=400) to disk — method, path,
+      // status, decoded response body, and request body — so any failure is
+      // diagnosable, not just 400s. Added before the 401 rewrite below so we
+      // still capture Anthropic's original body even when we replace it for the
+      // client. Files land in ~/.claude-share/logs/api-error-<status>-<ts>.log
+      // and are linked to the dashboard row via setErrorLogFile.
+      if (status >= 400 && host === "api.anthropic.com") {
+        const encoding = (ctx.serverToProxyResponse?.headers?.["content-encoding"] ?? "") as string;
+        const resChunks: Buffer[] = [];
+        ctx.addResponseFilter(
+          new Transform({
+            transform(chunk, _enc, done) {
+              resChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              this.push(chunk);
+              done();
+            },
+            flush(done) {
+              const raw = Buffer.concat(resChunks);
+              let resBody: string;
+              try {
+                if (encoding === "gzip") resBody = zlib.gunzipSync(raw).toString("utf8");
+                else if (encoding === "deflate") resBody = zlib.inflateSync(raw).toString("utf8");
+                else if (encoding === "br") resBody = zlib.brotliDecompressSync(raw).toString("utf8");
+                else resBody = raw.toString("utf8");
+              } catch {
+                resBody = raw.toString("utf8");
+              }
+              const reqBody = ctx[CTX_REQUEST_BODY] ?? "(not captured)";
+
+              const logDir = path.join(os.homedir(), ".claude-share", "logs");
+              try {
+                fs.mkdirSync(logDir, { recursive: true });
+                const logFilename = `api-error-${status}-${Date.now()}.log`;
+                const logPath = path.join(logDir, logFilename);
+                const logContent = [
+                  `TIMESTAMP: ${new Date().toISOString()}`,
+                  `METHOD: ${ctx.clientToProxyRequest?.method ?? ""}`,
+                  `PATH: ${ctx.clientToProxyRequest?.url ?? ""}`,
+                  `RESPONSE STATUS: ${status}`,
+                  `RESPONSE BODY:\n${resBody}\n`,
+                  `REQUEST BODY (FIRST 5000 CHARS):\n${reqBody.slice(0, 5000)}\n`,
+                  `REQUEST BODY (FULL):\n${reqBody}`,
+                ].join("\n\n");
+
+                fs.writeFileSync(logPath, logContent, "utf8");
+                if (logId !== undefined) {
+                  setErrorLogFile(logId, logFilename);
+                }
+                logger.error(`[mitm] API ${status} error. Logged request/response to ${logPath}`);
+              } catch (logErr) {
+                logger.error("[mitm] failed to write API error log", logErr);
+              }
+              done();
+            },
+          }),
+        );
+      }
+
       if (status === 401 && host === "api.anthropic.com") {
         const body = Buffer.from(
           JSON.stringify({
@@ -296,47 +355,6 @@ export async function createMitmProxy(
             },
             flush(done) {
               this.push(body);
-              done();
-            },
-          }),
-        );
-      }
-
-      if (status === 400 && host === "api.anthropic.com") {
-        const resChunks: Buffer[] = [];
-        ctx.addResponseFilter(
-          new Transform({
-            transform(chunk, _enc, done) {
-              resChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-              this.push(chunk);
-              done();
-            },
-            flush(done) {
-              const resBody = Buffer.concat(resChunks).toString("utf8");
-              const reqBody = ctx[CTX_REQUEST_BODY] ?? "(not captured)";
-              
-              const logDir = path.join(os.homedir(), ".claude-share", "logs");
-              try {
-                fs.mkdirSync(logDir, { recursive: true });
-                const logFilename = `api-error-400-${Date.now()}.log`;
-                const logPath = path.join(logDir, logFilename);
-                const logContent = [
-                  `TIMESTAMP: ${new Date().toISOString()}`,
-                  `PATH: ${ctx.clientToProxyRequest?.url ?? ""}`,
-                  `RESPONSE STATUS: 400`,
-                  `RESPONSE BODY:\n${resBody}\n`,
-                  `REQUEST BODY (FIRST 5000 CHARS):\n${reqBody.slice(0, 5000)}\n`,
-                  `REQUEST BODY (FULL):\n${reqBody}`
-                ].join("\n\n");
-                
-                fs.writeFileSync(logPath, logContent, "utf8");
-                if (logId !== undefined) {
-                  setErrorLogFile(logId, logFilename);
-                }
-                logger.error(`[mitm] API 400 Error. Logged request/response to ${logPath}`);
-              } catch (logErr) {
-                logger.error("[mitm] failed to write API 400 error log", logErr);
-              }
               done();
             },
           }),

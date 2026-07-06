@@ -375,11 +375,11 @@ export function createApiApp(
                 </div>
             </div>
 
-            <!-- API 400 Error History -->
+            <!-- API Error History -->
             <div id="error-logs-section" class="hidden glass-panel rounded-2xl overflow-hidden border-l-red-500 border-l-2">
                 <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
                     <div class="flex items-center gap-2">
-                        <h3 class="text-base font-semibold text-zinc-200">API 400 Error History</h3>
+                        <h3 class="text-base font-semibold text-zinc-200">API Error History</h3>
                         <span class="px-2 py-0.5 text-[10px] font-bold bg-red-950/20 text-red-400 border border-red-900/30 rounded-md">Error Logger</span>
                     </div>
                     <button onclick="loadErrorLogsList()" class="text-xs text-cyan-400 font-semibold hover:text-cyan-300">Refresh</button>
@@ -565,11 +565,13 @@ export function createApiApp(
                 data.logs.forEach(log => {
                     const time = new Date(log.createdAt).toLocaleString();
                     const sizeKB = (log.size / 1024).toFixed(1) + ' KB';
-                    
+                    const statusMatch = /^api-error-(\d+)-/.exec(log.filename);
+                    const statusText = statusMatch ? 'HTTP ' + statusMatch[1] : 'API Error';
+
                     const div = document.createElement('div');
                     div.className = 'flex items-center justify-between p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg hover:border-zinc-700 transition';
                     div.innerHTML = '<div class="flex flex-col">' +
-                        '<span class="font-semibold text-red-400">Bad Request (400)</span>' +
+                        '<span class="font-semibold text-red-400">' + statusText + '</span>' +
                         '<span class="text-zinc-500 text-[10px]">' + time + ' (' + sizeKB + ')</span>' +
                         '</div>' +
                         '<button onclick="viewErrorDetails(' + "'" + log.filename + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View Details</button>';
@@ -848,13 +850,13 @@ export function createApiApp(
     return c.json({ logs });
   });
 
-  /** GET /api/dashboard/error-logs — list recent API 400 error logs */
+  /** GET /api/dashboard/error-logs — list recent API error logs (any status) */
   app.get("/api/dashboard/error-logs", dashboardAuth, (c) => {
     const logDir = path.join(os.homedir(), ".claude-share", "logs");
     try {
       if (!fs.existsSync(logDir)) return c.json({ logs: [] });
       const files = fs.readdirSync(logDir)
-        .filter((f) => f.startsWith("api-error-400-") && f.endsWith(".log"))
+        .filter((f) => f.startsWith("api-error-") && f.endsWith(".log"))
         .map((f) => {
           const stats = fs.statSync(path.join(logDir, f));
           return {
@@ -870,10 +872,10 @@ export function createApiApp(
     }
   });
 
-  /** GET /api/dashboard/error-logs/:filename — read specific API 400 error log */
+  /** GET /api/dashboard/error-logs/:filename — read specific API error log */
   app.get("/api/dashboard/error-logs/:filename", dashboardAuth, (c) => {
     const filename = c.req.param("filename");
-    if (!filename.startsWith("api-error-400-") || !filename.endsWith(".log") || filename.includes("..") || filename.includes("/")) {
+    if (!filename.startsWith("api-error-") || !filename.endsWith(".log") || filename.includes("..") || filename.includes("/")) {
       return c.text("Invalid filename", 400);
     }
     const logPath = path.join(os.homedir(), ".claude-share", "logs", filename);
