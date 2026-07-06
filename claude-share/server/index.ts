@@ -17,16 +17,52 @@ import {
   heartbeatMachineSession,
   regeneratePairingCode,
   removeMachine,
+  setSessionUnlimited,
   type ConnectionFile,
   type SharerAccount,
 } from "../session/manager";
 
 import { getTotalStats, getMachineStats } from "../proxy/tokenCounter";
 import { getEntries } from "../proxy/requestLog";
+import { readUsageEvents, byModel } from "../proxy/usageLog";
+import { getAccessToken } from "../proxy/token";
+import {
+  isRecording,
+  setRecording,
+  isIncludingMessages,
+  setIncludeMessages,
+  listFlows,
+  readFlow,
+} from "../proxy/flowLog";
 
 interface Urls {
   public: string | null;
   lan: string | null;
+}
+
+// Keys whose values must never leave the sharer's machine, even to the (auth'd)
+// dashboard. The Sessions tab shows saved state files with these stripped.
+const SECRET_KEYS = new Set([
+  "key",
+  "pairingCode",
+  "proxyPass",
+  "secret",
+  "password",
+  "accessToken",
+  "refreshToken",
+  "token",
+]);
+
+function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SECRET_KEYS.has(k) ? "[REDACTED]" : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
 }
 
 export function createApiApp(
@@ -243,7 +279,17 @@ export function createApiApp(
             </div>
         </header>
 
-        <main class="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
+        <main class="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
+            <!-- Tab bar -->
+            <div class="flex gap-1 mb-6 border-b border-zinc-800">
+                <button data-tab="dashboard" onclick="showTab('dashboard')" class="tab-btn px-4 py-2 text-sm font-semibold border-b-2 border-cyan-500 text-cyan-400">Dashboard</button>
+                <button data-tab="errors" onclick="showTab('errors')" class="tab-btn px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-zinc-400 hover:text-zinc-200">Errors</button>
+                <button data-tab="sessions" onclick="showTab('sessions')" class="tab-btn px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-zinc-400 hover:text-zinc-200">Sessions</button>
+                <button data-tab="dev" onclick="showTab('dev')" class="tab-btn px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-zinc-400 hover:text-zinc-200">Dev</button>
+            </div>
+
+            <!-- Dashboard tab -->
+            <div id="tab-dashboard" class="tab-panel space-y-6">
             <!-- Grid of Header Cards -->
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <!-- Share Link Details -->
@@ -282,7 +328,12 @@ export function createApiApp(
                 <!-- Session Time Card -->
                 <div class="glass-panel p-5 rounded-2xl flex flex-col justify-between">
                     <div>
-                        <h3 class="text-base font-semibold text-zinc-300 mb-1">Time Remaining</h3>
+                        <div class="flex items-center justify-between mb-1">
+                            <h3 class="text-base font-semibold text-zinc-300">Time Remaining</h3>
+                            <button id="unlimited-btn" class="px-3 py-1.5 text-xs font-semibold text-emerald-400 border border-emerald-950/30 bg-emerald-950/10 hover:bg-emerald-950/20 rounded-lg transition">
+                                Set Unlimited
+                            </button>
+                        </div>
                         <span id="remaining-time" class="text-3xl font-bold tracking-tight text-zinc-200 block py-2 font-mono"></span>
                     </div>
                     <div class="border-t border-zinc-800/80 pt-3 flex items-center justify-between">
@@ -333,6 +384,23 @@ export function createApiApp(
                 <span id="stat-requests" class="text-lg font-bold text-zinc-200 font-mono"></span>
             </div>
 
+            <!-- Usage breakdown -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div class="glass-panel rounded-2xl overflow-hidden lg:col-span-2">
+                    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                        <h3 class="text-base font-semibold text-zinc-200">Usage (live)</h3>
+                        <span class="text-[10px] text-zinc-500">Sharer's plan limits · via Anthropic</span>
+                    </div>
+                    <div class="p-4 space-y-4 text-xs" id="live-usage-container"></div>
+                </div>
+                <div class="glass-panel rounded-2xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-zinc-800 bg-zinc-900/10">
+                        <h3 class="text-base font-semibold text-zinc-200">By Model (tokens)</h3>
+                    </div>
+                    <div class="p-4 space-y-2 text-xs" id="usage-models-container"></div>
+                </div>
+            </div>
+
             <!-- Connected Devices Table -->
             <div class="glass-panel rounded-2xl overflow-hidden">
                 <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
@@ -375,8 +443,12 @@ export function createApiApp(
                 </div>
             </div>
 
+            </div><!-- end #tab-dashboard -->
+
+            <!-- Errors tab -->
+            <div id="tab-errors" class="tab-panel hidden">
             <!-- API Error History -->
-            <div id="error-logs-section" class="hidden glass-panel rounded-2xl overflow-hidden border-l-red-500 border-l-2">
+            <div id="error-logs-section" class="glass-panel rounded-2xl overflow-hidden border-l-red-500 border-l-2">
                 <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
                     <div class="flex items-center gap-2">
                         <h3 class="text-base font-semibold text-zinc-200">API Error History</h3>
@@ -384,8 +456,73 @@ export function createApiApp(
                     </div>
                     <button onclick="loadErrorLogsList()" class="text-xs text-cyan-400 font-semibold hover:text-cyan-300">Refresh</button>
                 </div>
-                <div class="p-4 bg-zinc-950/50 max-h-48 overflow-y-auto space-y-2 text-xs" id="error-logs-list-container">
-                    <!-- List of 400 error logs -->
+                <div class="p-4 bg-zinc-950/50 max-h-[32rem] overflow-y-auto space-y-2 text-xs" id="error-logs-list-container">
+                    <!-- Error logs populated here -->
+                </div>
+            </div>
+            </div><!-- end #tab-errors -->
+
+            <!-- Sessions tab -->
+            <div id="tab-sessions" class="tab-panel hidden space-y-4">
+                <div class="glass-panel rounded-2xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                        <h3 class="text-base font-semibold text-zinc-200">Saved State Files</h3>
+                        <button onclick="loadStateFiles()" class="text-xs text-cyan-400 font-semibold hover:text-cyan-300">Refresh</button>
+                    </div>
+                    <div class="p-4 bg-zinc-950/50 space-y-2 text-xs" id="state-files-container"></div>
+                </div>
+                <div id="state-file-viewer" class="hidden glass-panel rounded-2xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                        <h3 class="text-base font-semibold text-zinc-200 font-mono" id="state-file-name">File</h3>
+                        <button onclick="document.getElementById('state-file-viewer').classList.add('hidden')" class="text-zinc-400 hover:text-zinc-200 text-lg font-bold">&times;</button>
+                    </div>
+                    <pre class="p-6 overflow-auto font-mono text-xs bg-zinc-950 text-zinc-300 max-h-[32rem] select-all" id="state-file-content" style="white-space: pre-wrap; word-break: break-all;"></pre>
+                </div>
+                <p class="text-[11px] text-zinc-500 px-2">Secrets (session keys, pairing codes, proxy passwords, tokens) are redacted before display.</p>
+            </div>
+
+            <!-- Dev tab -->
+            <div id="tab-dev" class="tab-panel hidden space-y-4">
+                <div class="glass-panel rounded-2xl overflow-hidden border-l-purple-500 border-l-2">
+                    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                        <div class="flex items-center gap-3">
+                            <h3 class="text-base font-semibold text-zinc-200">Traffic Recorder</h3>
+                            <span id="rec-state" class="px-2 py-0.5 text-[10px] font-bold rounded-md bg-zinc-800 text-zinc-400">OFF</span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <label class="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none">
+                                <input type="checkbox" id="rec-include-messages" onchange="toggleIncludeMessages()" class="accent-purple-500" />
+                                Include messages (prompts)
+                            </label>
+                            <button id="rec-toggle" onclick="toggleRecording()" class="px-3 py-1.5 text-xs font-semibold text-purple-300 border border-purple-950/40 bg-purple-950/10 hover:bg-purple-950/20 rounded-lg transition">Start recording</button>
+                            <button onclick="loadFlows()" class="text-xs text-cyan-400 font-semibold hover:text-cyan-300">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="px-6 py-2 text-[11px] text-amber-400/70 bg-amber-950/10 border-b border-zinc-800">Records the API calls (usage, profile, models, telemetry) to disk (~/.claude-share/flows). <b>/v1/messages</b> (your prompts) are excluded unless you tick "Include messages".</div>
+                    <div class="p-4 bg-zinc-950/50 max-h-80 overflow-y-auto space-y-2 text-xs" id="flows-container"></div>
+                </div>
+                <div id="flow-viewer" class="hidden glass-panel rounded-2xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/10">
+                        <h3 class="text-base font-semibold text-zinc-200 font-mono" id="flow-title">Flow</h3>
+                        <div class="flex items-center gap-2">
+                            <button id="flow-replay-btn" class="px-3 py-1.5 text-xs font-semibold text-emerald-300 border border-emerald-950/40 bg-emerald-950/10 hover:bg-emerald-950/20 rounded-lg transition">Replay</button>
+                            <button onclick="document.getElementById('flow-viewer').classList.add('hidden')" class="text-zinc-400 hover:text-zinc-200 text-lg font-bold">&times;</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-zinc-800">
+                        <div>
+                            <div class="px-4 py-2 text-[10px] uppercase font-bold text-zinc-500 border-b border-zinc-800">Request</div>
+                            <pre class="p-4 overflow-auto font-mono text-[11px] bg-zinc-950 text-zinc-300 max-h-96 select-all" id="flow-req" style="white-space: pre-wrap; word-break: break-all;"></pre>
+                        </div>
+                        <div>
+                            <div class="px-4 py-2 text-[10px] uppercase font-bold text-zinc-500 border-b border-zinc-800">Response</div>
+                            <pre class="p-4 overflow-auto font-mono text-[11px] bg-zinc-950 text-zinc-300 max-h-96 select-all" id="flow-res" style="white-space: pre-wrap; word-break: break-all;"></pre>
+                        </div>
+                    </div>
+                    <div id="flow-replay-result" class="hidden border-t border-zinc-800">
+                        <div class="px-4 py-2 text-[10px] uppercase font-bold text-emerald-500 border-b border-zinc-800">Replay result <span id="flow-replay-status" class="text-zinc-400"></span></div>
+                        <pre class="p-4 overflow-auto font-mono text-[11px] bg-zinc-950 text-zinc-300 max-h-96 select-all" id="flow-replay-body" style="white-space: pre-wrap; word-break: break-all;"></pre>
+                    </div>
                 </div>
             </div>
         </main>
@@ -479,6 +616,7 @@ export function createApiApp(
         function formatExpiry(expiryStr) {
             const ms = new Date(expiryStr).getTime() - Date.now();
             if (ms <= 0) return 'Expired';
+            if (ms > 50 * 365 * 24 * 60 * 60 * 1000) return 'Unlimited';
             const h = Math.floor(ms / 3600000);
             const m = Math.floor((ms % 3600000) / 60000);
             const s = Math.floor((ms % 60000) / 1000);
@@ -552,16 +690,13 @@ export function createApiApp(
             try {
                 const data = await apiCall('/api/dashboard/error-logs');
                 const container = el('error-logs-list-container');
-                const section = el('error-logs-section');
-                
+                container.innerHTML = '';
+
                 if (data.logs.length === 0) {
-                    section.classList.add('hidden');
+                    container.innerHTML = '<span class="text-zinc-600 italic">No API errors recorded yet.</span>';
                     return;
                 }
-                
-                section.classList.remove('hidden');
-                container.innerHTML = '';
-                
+
                 data.logs.forEach(log => {
                     const time = new Date(log.createdAt).toLocaleString();
                     const sizeKB = (log.size / 1024).toFixed(1) + ' KB';
@@ -683,8 +818,227 @@ export function createApiApp(
                 await loadLogs();
                 // Fetch error logs list
                 await loadErrorLogsList();
+                // Refresh usage at most every 12s (reads the full usage ledger)
+                if (Date.now() - lastUsageLoad > 12000) {
+                    lastUsageLoad = Date.now();
+                    loadUsage();
+                }
             } catch (err) {
                 console.error(err);
+            }
+        }
+
+        let lastUsageLoad = 0;
+
+        function showTab(name) {
+            ['dashboard', 'errors', 'sessions', 'dev'].forEach(t => {
+                el('tab-' + t).classList.toggle('hidden', t !== name);
+            });
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                const active = b.getAttribute('data-tab') === name;
+                b.classList.toggle('border-cyan-500', active);
+                b.classList.toggle('text-cyan-400', active);
+                b.classList.toggle('border-transparent', !active);
+                b.classList.toggle('text-zinc-400', !active);
+            });
+            if (name === 'errors') loadErrorLogsList();
+            else if (name === 'sessions') loadStateFiles();
+            else if (name === 'dev') loadFlows();
+            else if (name === 'dashboard') { lastUsageLoad = Date.now(); loadUsage(); }
+        }
+
+        let recOn = false;
+        function renderRecState(state) {
+            recOn = !!state.recording;
+            const badge = el('rec-state');
+            const btn = el('rec-toggle');
+            badge.innerText = recOn ? 'REC' : 'OFF';
+            badge.className = 'px-2 py-0.5 text-[10px] font-bold rounded-md ' +
+                (recOn ? 'bg-red-950/30 text-red-400 border border-red-900/40 animate-pulse' : 'bg-zinc-800 text-zinc-400');
+            btn.innerText = recOn ? 'Stop recording' : 'Start recording';
+            el('rec-include-messages').checked = !!state.includeMessages;
+        }
+
+        async function toggleRecording() {
+            try {
+                const res = await apiCall('/api/dashboard/dev/recording', 'POST', { on: !recOn });
+                renderRecState(res);
+            } catch (err) { alert(err.message); }
+        }
+
+        async function toggleIncludeMessages() {
+            try {
+                const res = await apiCall('/api/dashboard/dev/recording', 'POST', { includeMessages: el('rec-include-messages').checked });
+                renderRecState(res);
+            } catch (err) { alert(err.message); }
+        }
+
+        async function loadFlows() {
+            try {
+                const data = await apiCall('/api/dashboard/dev/flows');
+                renderRecState(data);
+                const c = el('flows-container');
+                c.innerHTML = '';
+                if (!data.flows.length) {
+                    c.innerHTML = '<span class="text-zinc-600 italic">No recorded flows yet. Start recording, then use Claude through the share.</span>';
+                    return;
+                }
+                data.flows.forEach(f => {
+                    const isErr = f.status >= 400;
+                    const div = document.createElement('div');
+                    div.className = 'flex items-center justify-between p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg';
+                    const title = (f.model ? escapeHtml(f.model) + ' · ' : '') + escapeHtml(f.method) + ' ' + escapeHtml(f.path);
+                    div.innerHTML = '<div class="flex flex-col min-w-0">' +
+                        '<span class="font-semibold text-zinc-200 truncate">' + title + '</span>' +
+                        '<span class="text-zinc-500 text-[10px]">' + new Date(f.ts).toLocaleString() + ' · ' + (f.size / 1024).toFixed(1) + ' KB · <span class="' + (isErr ? 'text-red-400' : 'text-green-400') + '">HTTP ' + f.status + '</span></span>' +
+                        '</div>' +
+                        '<button onclick="viewFlow(' + "'" + f.file + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition shrink-0">Inspect</button>';
+                    c.appendChild(div);
+                });
+            } catch (err) { console.error(err); }
+        }
+
+        function prettyJson(s) {
+            try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+        }
+
+        async function viewFlow(file) {
+            try {
+                const data = await apiCall('/api/dashboard/dev/flow?file=' + encodeURIComponent(file));
+                const f = data.flow;
+                el('flow-title').innerText = (f.model ? f.model + ' · ' : '') + f.method + ' ' + f.path;
+                el('flow-req').innerText = prettyJson(f.reqBody);
+                el('flow-res').innerText = prettyJson(f.resBody);
+                el('flow-replay-result').classList.add('hidden');
+                el('flow-replay-btn').onclick = () => replayFlow(file);
+                el('flow-viewer').classList.remove('hidden');
+            } catch (err) { alert('Failed to load flow: ' + err.message); }
+        }
+
+        async function replayFlow(file) {
+            const btn = el('flow-replay-btn');
+            const orig = btn.innerText;
+            btn.innerText = 'Replaying...';
+            btn.disabled = true;
+            try {
+                const res = await apiCall('/api/dashboard/dev/replay', 'POST', { file });
+                el('flow-replay-result').classList.remove('hidden');
+                if (res.error) {
+                    el('flow-replay-status').innerText = '(error)';
+                    el('flow-replay-body').innerText = res.error;
+                } else {
+                    el('flow-replay-status').innerText = 'HTTP ' + res.status;
+                    el('flow-replay-body').innerText = prettyJson(res.body);
+                }
+            } catch (err) {
+                alert('Replay failed: ' + err.message);
+            } finally {
+                btn.innerText = orig;
+                btn.disabled = false;
+            }
+        }
+
+        const USAGE_LABELS = {
+            five_hour: 'Current session',
+            seven_day: 'Current week (all models)',
+            seven_day_opus: 'Current week (Opus)',
+            seven_day_sonnet: 'Current week (Sonnet)',
+        };
+        function usageLabel(key) {
+            if (USAGE_LABELS[key]) return USAGE_LABELS[key];
+            if (/fable/i.test(key)) return 'Current week (Fable)';
+            if (/mythos/i.test(key)) return 'Current week (Mythos)';
+            return key;
+        }
+        function usageRank(key) {
+            if (key === 'five_hour') return 0;
+            if (key === 'seven_day') return 1;
+            if (/fable/i.test(key)) return 2;
+            return 3;
+        }
+
+        async function loadLiveUsage() {
+            const container = el('live-usage-container');
+            try {
+                const data = await apiCall('/api/dashboard/live-usage');
+                if (data.error) {
+                    container.innerHTML = '<span class="text-amber-400/80 italic">Live usage unavailable: ' + escapeHtml(data.error) + '</span>';
+                    return;
+                }
+                const usage = data.usage || {};
+                const entries = Object.entries(usage).filter(([, v]) =>
+                    v && typeof v === 'object' && ('utilization' in v || 'percent' in v)
+                );
+                if (!entries.length) {
+                    container.innerHTML = '<span class="text-zinc-600 italic">No usage data returned.</span>';
+                    return;
+                }
+                entries.sort((a, b) => usageRank(a[0]) - usageRank(b[0]));
+                container.innerHTML = entries.map(([key, v]) => {
+                    let raw = (v.utilization !== undefined ? v.utilization : v.percent) || 0;
+                    const pct = raw <= 1 ? Math.round(raw * 100) : Math.round(raw);
+                    const reset = v.resets_at ? 'Resets ' + new Date(v.resets_at).toLocaleString() : '';
+                    const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-500' : 'bg-cyan-600';
+                    return '<div>' +
+                        '<div class="flex justify-between mb-1"><span class="font-semibold text-zinc-200">' + escapeHtml(usageLabel(key)) + '</span>' +
+                        '<span class="text-zinc-300 font-mono">' + pct + '% used</span></div>' +
+                        '<div class="bg-zinc-900 rounded h-3 overflow-hidden"><div class="' + barColor + ' h-3" style="width:' + Math.min(100, pct) + '%"></div></div>' +
+                        (reset ? '<span class="text-zinc-500 text-[10px]">' + escapeHtml(reset) + '</span>' : '') +
+                        '</div>';
+                }).join('');
+            } catch (err) {
+                container.innerHTML = '<span class="text-zinc-600 italic">Failed to load live usage.</span>';
+            }
+        }
+
+        async function loadUsage() {
+            await loadLiveUsage();
+            try {
+                const data = await apiCall('/api/dashboard/usage');
+                const mc = el('usage-models-container');
+                mc.innerHTML = data.byModel.map(m =>
+                    '<div class="flex flex-col gap-0.5 pb-2 border-b border-zinc-800/50">' +
+                        '<span class="font-semibold text-zinc-200 truncate">' + escapeHtml(m.model) + '</span>' +
+                        '<span class="text-zinc-400 font-mono">' + fmtTokens(m.input) + ' in · ' + fmtTokens(m.output) + ' out · ' + m.requests + ' req</span>' +
+                    '</div>'
+                ).join('') || '<span class="text-zinc-600 italic">No token usage recorded yet.</span>';
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        async function loadStateFiles() {
+            try {
+                const data = await apiCall('/api/dashboard/state-files');
+                const c = el('state-files-container');
+                c.innerHTML = '';
+                if (!data.files.length) {
+                    c.innerHTML = '<span class="text-zinc-600 italic">No state files.</span>';
+                    return;
+                }
+                data.files.forEach(f => {
+                    const div = document.createElement('div');
+                    div.className = 'flex items-center justify-between p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg';
+                    div.innerHTML = '<div class="flex flex-col">' +
+                        '<span class="font-semibold text-zinc-200 font-mono">' + escapeHtml(f.name) + '</span>' +
+                        '<span class="text-zinc-500 text-[10px]">' + new Date(f.modifiedAt).toLocaleString() + ' · ' + (f.size / 1024).toFixed(1) + ' KB</span>' +
+                        '</div>' +
+                        '<button onclick="viewStateFile(' + "'" + f.name + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-cyan-400 bg-cyan-950/20 border border-cyan-900/30 hover:bg-cyan-950/50 rounded transition">View</button>';
+                    c.appendChild(div);
+                });
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        async function viewStateFile(name) {
+            try {
+                const data = await apiCall('/api/dashboard/state-file?name=' + encodeURIComponent(name));
+                el('state-file-name').innerText = data.name;
+                el('state-file-content').innerText = JSON.stringify(data.content, null, 2);
+                el('state-file-viewer').classList.remove('hidden');
+            } catch (err) {
+                alert('Failed to load file: ' + err.message);
             }
         }
 
@@ -703,6 +1057,17 @@ export function createApiApp(
             try {
                 const res = await apiCall('/api/dashboard/regenerate', 'POST');
                 setPairingCode(res.pairingCode);
+                loadStats();
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        async function handleSetUnlimited() {
+            if (!confirm('Set this share to unlimited time? It will no longer expire until you stop it.')) return;
+            try {
+                const res = await apiCall('/api/dashboard/set-unlimited', 'POST');
+                el('remaining-time').innerText = formatExpiry(res.sharedUntil);
                 loadStats();
             } catch (err) {
                 alert(err.message);
@@ -730,9 +1095,11 @@ export function createApiApp(
         window.addEventListener('load', () => {
             el('login-form').addEventListener('submit', handleLogin);
             el('regen-btn').addEventListener('click', handleRegenerate);
+            el('unlimited-btn').addEventListener('click', handleSetUnlimited);
             
             if (getPairingCode()) {
                 showDashboard();
+                showTab('dashboard');
                 loadStats();
             } else {
                 showAuth();
@@ -894,6 +1261,143 @@ export function createApiApp(
     regeneratePairingCode(session);
     saveSession(session);
     return c.json({ ok: true, pairingCode: session.pairingCode });
+  });
+
+  /** POST /api/dashboard/set-unlimited — switch the active share to unlimited time */
+  app.post("/api/dashboard/set-unlimited", dashboardAuth, (c) => {
+    const session = setSessionUnlimited();
+    if (!session) return c.text("No active session", 404);
+    return c.json({ ok: true, sharedUntil: session.sharedUntil.toISOString() });
+  });
+
+  /** GET /api/dashboard/usage — token volume per model seen through the proxy */
+  app.get("/api/dashboard/usage", dashboardAuth, (c) => {
+    const events = readUsageEvents();
+    return c.json({ byModel: byModel(events), totalEvents: events.length });
+  });
+
+  /**
+   * GET /api/dashboard/live-usage — the sharer's real plan utilization, i.e. the
+   * same data Claude Code's own `/usage` shows (session 5h, weekly, per-model
+   * incl. Fable). Fetched live from Anthropic with the sharer's token.
+   */
+  app.get("/api/dashboard/live-usage", dashboardAuth, async (c) => {
+    try {
+      const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: {
+          authorization: `Bearer ${getAccessToken()}`,
+          "anthropic-beta": "oauth-2025-04-20",
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      if (!res.ok) {
+        return c.json({ error: `Anthropic returned HTTP ${res.status}` });
+      }
+      return c.json({ usage: await res.json() });
+    } catch (err) {
+      return c.json({ error: String(err) });
+    }
+  });
+
+  // ── Dev recorder / replay ──────────────────────────────────────────────────
+
+  /** GET /api/dashboard/dev/recording — current recorder state */
+  app.get("/api/dashboard/dev/recording", dashboardAuth, (c) =>
+    c.json({ recording: isRecording(), includeMessages: isIncludingMessages() }),
+  );
+
+  /** POST /api/dashboard/dev/recording {on, includeMessages} — toggle recorder */
+  app.post("/api/dashboard/dev/recording", dashboardAuth, async (c) => {
+    const body = await c.req.json<{ on?: boolean; includeMessages?: boolean }>();
+    if (typeof body.on === "boolean") setRecording(body.on);
+    if (typeof body.includeMessages === "boolean") setIncludeMessages(body.includeMessages);
+    return c.json({ recording: isRecording(), includeMessages: isIncludingMessages() });
+  });
+
+  /** GET /api/dashboard/dev/flows — list recorded request/response flows */
+  app.get("/api/dashboard/dev/flows", dashboardAuth, (c) =>
+    c.json({
+      recording: isRecording(),
+      includeMessages: isIncludingMessages(),
+      flows: listFlows(),
+    }),
+  );
+
+  /** GET /api/dashboard/dev/flow?file=... — full recorded flow */
+  app.get("/api/dashboard/dev/flow", dashboardAuth, (c) => {
+    const flow = readFlow(c.req.query("file") ?? "");
+    if (!flow) return c.text("Not found", 404);
+    return c.json({ flow });
+  });
+
+  /**
+   * POST /api/dashboard/dev/replay {file} — re-send a recorded request to
+   * Anthropic with the sharer's token and return the fresh response. Lets you
+   * reproduce a bug against the exact captured request body later.
+   */
+  app.post("/api/dashboard/dev/replay", dashboardAuth, async (c) => {
+    const { file } = await c.req.json<{ file?: string }>();
+    const flow = readFlow(file ?? "");
+    if (!flow) return c.text("Not found", 404);
+    try {
+      const headers: Record<string, string> = {
+        authorization: `Bearer ${getAccessToken()}`,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      };
+      if (flow.beta) headers["anthropic-beta"] = flow.beta;
+      const res = await fetch("https://api.anthropic.com" + flow.path, {
+        method: flow.method,
+        headers,
+        body: flow.method === "POST" ? flow.reqBody : undefined,
+      });
+      const text = await res.text();
+      return c.json({ status: res.status, body: text.slice(0, 40000) });
+    } catch (err) {
+      return c.json({ error: String(err) });
+    }
+  });
+
+  /** GET /api/dashboard/state-files — list the ~/.claude-share JSON state files */
+  app.get("/api/dashboard/state-files", dashboardAuth, (c) => {
+    const baseDir = path.join(os.homedir(), ".claude-share");
+    const files: Array<{ name: string; size: number; modifiedAt: string }> = [];
+    const collect = (dir: string, prefix: string) => {
+      try {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (entry.isFile() && entry.name.endsWith(".json")) {
+            const stat = fs.statSync(path.join(dir, entry.name));
+            files.push({
+              name: prefix + entry.name,
+              size: stat.size,
+              modifiedAt: stat.mtime.toISOString(),
+            });
+          } else if (entry.isDirectory() && entry.name === "connections") {
+            collect(path.join(dir, entry.name), "connections/");
+          }
+        }
+      } catch {}
+    };
+    collect(baseDir, "");
+    files.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+    return c.json({ files });
+  });
+
+  /** GET /api/dashboard/state-file?name=... — read one state file with secrets redacted */
+  app.get("/api/dashboard/state-file", dashboardAuth, (c) => {
+    const name = c.req.query("name") ?? "";
+    // Allow only "<file>.json" or "connections/<file>.json"; no traversal.
+    if (!/^(connections\/)?[A-Za-z0-9._-]+\.json$/.test(name) || name.includes("..")) {
+      return c.text("Invalid filename", 400);
+    }
+    const filePath = path.join(os.homedir(), ".claude-share", name);
+    try {
+      if (!fs.existsSync(filePath)) return c.text("File not found", 404);
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      return c.json({ name, content: redactSecrets(parsed) });
+    } catch (err) {
+      return c.text(String(err), 500);
+    }
   });
 
   /** POST /api/dashboard/revoke — revokes a client machine via web UI */

@@ -48,6 +48,8 @@ function formatRelative(date: Date): string {
 function formatExpiry(date: Date): string {
   const ms = date.getTime() - Date.now();
   if (ms <= 0) return "expired";
+  // ~50 years out = the "Unlimited" sentinel (see setSessionUnlimited).
+  if (ms > 50 * 365 * 24 * 60 * 60 * 1000) return "Unlimited";
   const h = Math.floor(ms / 3_600_000);
   const m = Math.floor((ms % 3_600_000) / 60_000);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;

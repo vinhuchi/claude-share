@@ -209,6 +209,25 @@ export function isSessionExpired(session: Session): boolean {
   return Date.now() > session.sharedUntil.getTime();
 }
 
+// "Unlimited" is represented as a far-future sharedUntil so every existing
+// expiry check (isSessionExpired, load-time prune, intervals) keeps working
+// unchanged. A share is treated as unlimited when its remaining time is beyond
+// UNLIMITED_THRESHOLD_MS — well past any real duration option.
+export const UNLIMITED_DURATION_MS = 100 * 365 * 24 * 60 * 60 * 1000; // ~100 years
+const UNLIMITED_THRESHOLD_MS = 50 * 365 * 24 * 60 * 60 * 1000; // ~50 years
+
+export function isUnlimitedDate(sharedUntil: Date): boolean {
+  return sharedUntil.getTime() - Date.now() > UNLIMITED_THRESHOLD_MS;
+}
+
+/** Switch the active session to an unlimited duration and persist it. */
+export function setSessionUnlimited(): Session | null {
+  if (!currentSession) return null;
+  currentSession.sharedUntil = new Date(Date.now() + UNLIMITED_DURATION_MS);
+  saveSession(currentSession);
+  return currentSession;
+}
+
 export function destroySession(): void {
   if (currentSession) {
     currentSession.key.fill(0);

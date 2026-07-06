@@ -51,6 +51,8 @@ import {
   isSessionExpired,
   getSession,
   checkMachineAuth,
+  UNLIMITED_DURATION_MS,
+  isUnlimitedDate,
   type SharerAccount,
 } from "./session/manager";
 import { App } from "./tui/App";
@@ -131,6 +133,7 @@ async function promptDuration(): Promise<number> {
       { value: 6 * 60 * 60 * 1000, label: "6 hours" },
       { value: 24 * 60 * 60 * 1000, label: "24 hours" },
       { value: 7 * 24 * 60 * 60 * 1000, label: "1 week" },
+      { value: UNLIMITED_DURATION_MS, label: "Unlimited" },
     ],
   });
 
@@ -146,6 +149,7 @@ function parseDurationFlag(): number {
   const arg = process.argv.find((a) => a.startsWith("--duration="));
   if (!arg) return 24 * 60 * 60 * 1000;
   const val = arg.slice("--duration=".length).trim().toLowerCase();
+  if (val === "unlimited" || val === "inf" || val === "0") return UNLIMITED_DURATION_MS;
   if (val.endsWith("h")) return parseInt(val, 10) * 60 * 60 * 1000;
   if (val.endsWith("d")) return parseInt(val, 10) * 24 * 60 * 60 * 1000;
   if (val.endsWith("m")) return parseInt(val, 10) * 60 * 1000;
@@ -211,8 +215,13 @@ async function main() {
   const isResuming = savedSession !== null;
 
   if (isResuming) {
-    const remaining = Math.round((savedSession!.sharedUntil.getTime() - Date.now()) / 60000);
-    const exp = remaining > 60 ? `${Math.floor(remaining / 60)}h ${remaining % 60}m` : `${remaining}m`;
+    let exp: string;
+    if (isUnlimitedDate(savedSession!.sharedUntil)) {
+      exp = "Unlimited";
+    } else {
+      const remaining = Math.round((savedSession!.sharedUntil.getTime() - Date.now()) / 60000);
+      exp = remaining > 60 ? `${Math.floor(remaining / 60)}h ${remaining % 60}m` : `${remaining}m`;
+    }
     p.log.info(`Resuming previous session — ${exp} remaining, ${savedSession!.machines.size} machine(s) paired`);
   }
 
@@ -505,7 +514,9 @@ async function main() {
     if (lanUrl)    process.stdout.write(`[claude-share] LAN:     ${connectUrl(lanUrl)}\n`);
     process.stdout.write(`[claude-share] Local:   ${connectUrl(loopbackUrl)}\n`);
 
-    const expiry = session.sharedUntil.toISOString();
+    const expiry = isUnlimitedDate(session.sharedUntil)
+      ? "Unlimited"
+      : session.sharedUntil.toISOString();
     process.stdout.write(`[claude-share] Sharing until ${expiry}\n`);
     process.stdout.write(`[claude-share] Ready. Port ${PORT}\n`);
 

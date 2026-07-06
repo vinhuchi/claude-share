@@ -11,6 +11,8 @@ import { generateServerCert, type ServerCert } from "../ca/serverCert";
 import { logger } from "../logger";
 import { logRequest, setResponseStatus, setErrorLogFile } from "./requestLog";
 import { recordTokens } from "./tokenCounter";
+import { recordUsageEvent } from "./usageLog";
+import { isRecording, isIncludingMessages, saveFlow } from "./flowLog";
 import { getAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
 
@@ -60,6 +62,10 @@ const API_ALLOWED_PATHS: Array<{ method: string | null; prefix: string }> = [
   // "not available for your account" even when the sharer's account has them.
   { method: "GET", prefix: "/api/oauth/profile" },
   { method: "GET", prefix: "/api/claude_cli_profile" },
+  // Plan usage/limits — powers Claude Code's own `/usage` (session 5h, weekly,
+  // per-model incl. Fable). Allowing it lets the receiver run `/usage` and lets
+  // the dashboard show the sharer's real utilization.
+  { method: "GET", prefix: "/api/oauth/usage" },
   // WebFetch preflight domain-reputation check — blocking it makes Claude Code
   // report "Unable to verify if domain X is safe to fetch" for every WebFetch.
   { method: "GET", prefix: "/api/web/domain_info" },
@@ -361,6 +367,54 @@ export async function createMitmProxy(
         );
       }
 
+      // Dev recorder: capture the non-message API calls (usage, profile,
+      // models, telemetry, …) with full request/response. Messages are excluded
+      // here and handled by the opt-in path in the token block below.
+      // Scoped to api.anthropic.com only — never the platform.* OAuth hosts,
+      // whose responses can carry raw tokens/auth codes.
+      const recPath = ctx.clientToProxyRequest?.url ?? "/";
+      if (
+        isRecording() &&
+        host === "api.anthropic.com" &&
+        !recPath.startsWith("/v1/messages")
+      ) {
+        const recEnc = (ctx.serverToProxyResponse?.headers?.["content-encoding"] ?? "") as string;
+        const recChunks: Buffer[] = [];
+        ctx.addResponseFilter(
+          new Transform({
+            transform(chunk, _enc, done) {
+              recChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              this.push(chunk);
+              done();
+            },
+            flush(done) {
+              const raw = Buffer.concat(recChunks);
+              let resBody: string;
+              try {
+                if (recEnc === "gzip") resBody = zlib.gunzipSync(raw).toString("utf8");
+                else if (recEnc === "deflate") resBody = zlib.inflateSync(raw).toString("utf8");
+                else if (recEnc === "br") resBody = zlib.brotliDecompressSync(raw).toString("utf8");
+                else resBody = raw.toString("utf8");
+              } catch {
+                resBody = raw.toString("utf8");
+              }
+              saveFlow({
+                id: Math.random().toString(36).slice(2, 10),
+                ts: Date.now(),
+                machineId: ctx[CTX_MACHINE_ID],
+                method: ctx.clientToProxyRequest?.method ?? "GET",
+                path: recPath,
+                model: "",
+                status,
+                reqBody: ctx[CTX_REQUEST_BODY] ?? "",
+                resBody,
+              });
+              done();
+            },
+          }),
+        );
+      }
+
       // Strip any response headers that could leak the sharer's credentials
       const respHeaders = ctx.serverToProxyResponse.headers;
       if (respHeaders) {
@@ -410,7 +464,40 @@ export async function createMitmProxy(
               const cache = caches.length > 0 ? parseInt(caches[caches.length - 1], 10) : 0;
               const cacheWrite = cacheWrites.length > 0 ? parseInt(cacheWrites[cacheWrites.length - 1], 10) : 0;
 
-              if (inp > 0 || out > 0) recordTokens(machineId!, inp, out, cache, cacheWrite);
+              // The model actually served appears in the message_start event.
+              const modelMatch = body.match(/"model"\s*:\s*"([^"]+)"/);
+              const model = modelMatch ? modelMatch[1] : "unknown";
+
+              if (inp > 0 || out > 0) {
+                recordTokens(machineId!, inp, out, cache, cacheWrite);
+                recordUsageEvent({
+                  ts: Date.now(),
+                  machineId: machineId!,
+                  model,
+                  input: inp,
+                  output: out,
+                  cacheRead: cache,
+                  cacheWrite,
+                });
+              }
+
+              // Dev recorder: message flows carry prompts, so only record them
+              // when the user explicitly opts in (Include messages).
+              if (isRecording() && isIncludingMessages()) {
+                const betaHeader = ctx.clientToProxyRequest?.headers?.["anthropic-beta"];
+                saveFlow({
+                  id: Math.random().toString(36).slice(2, 10),
+                  ts: Date.now(),
+                  machineId,
+                  method: "POST",
+                  path: reqPath,
+                  model,
+                  status,
+                  beta: typeof betaHeader === "string" ? betaHeader : undefined,
+                  reqBody: ctx[CTX_REQUEST_BODY] ?? "",
+                  resBody: body,
+                });
+              }
               done();
             },
           }),
