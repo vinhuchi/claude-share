@@ -7,6 +7,12 @@ import { logger } from "../logger";
 let cached: OAuthCredentials | null = null;
 let refreshTimer: NodeJS.Timeout | null = null;
 
+// If the cached token has less than this left, re-read the on-disk credentials
+// (which the sharer's live Claude CLI keeps fresh) before injecting it.
+const STALE_THRESHOLD_MS = 60_000;
+// Coalesce concurrent re-reads so a burst of proxied requests triggers one read.
+let rereadInFlight: Promise<void> | null = null;
+
 function spawnClaudeForRefresh(): Promise<void> {
   return new Promise((resolve, reject) => {
     // Run 'claude -p HI' to trigger Claude CLI's internal OAuth refresh flow.
@@ -70,6 +76,35 @@ export async function initToken(): Promise<void> {
 export function getAccessToken(): string {
   if (!cached)
     throw new Error("Token not initialized — call initToken() first");
+  return cached.accessToken;
+}
+
+// Inject path for the proxy. The on-disk credential store is the source of
+// truth (the sharer's live Claude CLI refreshes it); the in-memory `cached`
+// snapshot only updates on the reread timer, so it can lag behind the file and
+// go stale between ticks. When it's within STALE_THRESHOLD_MS of expiry, re-read
+// the file so the proxy never injects a token the CLI has already rotated out.
+export async function getFreshAccessToken(): Promise<string> {
+  if (!cached)
+    throw new Error("Token not initialized — call initToken() first");
+
+  if (cached.expiresAt - Date.now() < STALE_THRESHOLD_MS) {
+    if (!rereadInFlight) {
+      rereadInFlight = platform()
+        .readOAuthCredentials()
+        .then((fresh) => {
+          if (fresh) cached = fresh;
+        })
+        .catch((err) => {
+          logger.error("[token] inline credential re-read failed", err);
+        })
+        .finally(() => {
+          rereadInFlight = null;
+        });
+    }
+    await rereadInFlight;
+  }
+
   return cached.accessToken;
 }
 

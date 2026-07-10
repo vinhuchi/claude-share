@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -13,7 +15,7 @@ import { logRequest, setResponseStatus, setErrorLogFile } from "./requestLog";
 import { recordTokens } from "./tokenCounter";
 import { recordUsageEvent } from "./usageLog";
 import { isRecording, isIncludingMessages, saveFlow } from "./flowLog";
-import { getAccessToken } from "./token";
+import { getAccessToken, getFreshAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
@@ -38,6 +40,7 @@ function redactEmails(obj: any): any {
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const CTX_REQUEST_BODY = Symbol("requestBody");
+const CTX_RETRIED = Symbol("retried");
 const socketMachineId = new WeakMap<object, string>();
 
 // Domains the proxy intercepts and forwards to Anthropic with injected token
@@ -145,9 +148,53 @@ export async function createMitmProxy(
       const isBenign = code === "ECONNRESET" || code === "HPE_INVALID_EOF_STATE";
       const clientAwaitingResponse =
         ctx?.proxyToClientResponse && !ctx.proxyToClientResponse.headersSent;
+
+      // Stale keep-alive socket race: the pooled connection to api.anthropic.com
+      // died between being pulled from the agent's free list and this request
+      // writing to it. Retry once on a fresh, non-pooled connection instead of
+      // surfacing the library's default 504 — same recovery Claude Code's own
+      // CLI uses for this exact ECONNRESET/EPIPE race (disableKeepAlive + fresh
+      // client + retry in its withRetry.ts).
+      if (
+        kind === "PROXY_TO_SERVER_REQUEST_ERROR" &&
+        code === "ECONNRESET" &&
+        clientAwaitingResponse &&
+        !ctx[CTX_RETRIED]
+      ) {
+        ctx[CTX_RETRIED] = true;
+        retryOnFreshConnection(ctx);
+        return;
+      }
+
       if (isBenign && !clientAwaitingResponse) return;
       _origOnError(kind, ctx, err);
     };
+
+    function retryOnFreshConnection(ctx: any) {
+      const options = { ...ctx.proxyToServerRequestOptions, agent: false as const };
+      const transport = ctx.isSSL ? https : http;
+      const retryReq = transport.request(options, (retryRes: any) => {
+        const clientRes = ctx.proxyToClientResponse;
+        if (!clientRes || clientRes.headersSent) return;
+        const headers = { ...retryRes.headers };
+        delete headers["authorization"];
+        delete headers["set-cookie"];
+        delete headers["x-api-key"];
+        delete headers["anthropic-organization-id"];
+        clientRes.writeHead(retryRes.statusCode ?? 502, headers);
+        retryRes.pipe(clientRes);
+      });
+      retryReq.on("error", (retryErr: Error) => {
+        logger.error("[mitm] retry on fresh connection failed", retryErr);
+        _origOnError("PROXY_TO_SERVER_REQUEST_ERROR", ctx, retryErr);
+      });
+      const body = ctx[CTX_REQUEST_BODY];
+      if (typeof body === "string") {
+        retryReq.end(Buffer.from(body));
+      } else {
+        retryReq.end();
+      }
+    }
 
     proxy.onError((ctx: any, err: any) => {
       if (!err) return;
@@ -225,44 +272,55 @@ export async function createMitmProxy(
 
       ctx.proxyToServerRequestOptions.headers =
         ctx.proxyToServerRequestOptions.headers ?? {};
-      ctx.proxyToServerRequestOptions.headers["authorization"] =
-        `Bearer ${getAccessToken()}`;
 
-      delete ctx.proxyToServerRequestOptions.headers["x-api-key"];
-      delete ctx.proxyToServerRequestOptions.headers["x-forwarded-for"];
-      delete ctx.proxyToServerRequestOptions.headers["x-real-ip"];
+      // Re-read the on-disk token if the cached snapshot is stale, so we never
+      // forward a token the sharer's CLI has already rotated out. Header rewrites,
+      // body redaction and callback() run in finally regardless of the outcome.
+      getFreshAccessToken()
+        .then((token) => {
+          ctx.proxyToServerRequestOptions.headers["authorization"] = `Bearer ${token}`;
+        })
+        .catch((err) => {
+          logger.error("[mitm] fresh token fetch failed, using cached token", err);
+          ctx.proxyToServerRequestOptions.headers["authorization"] = `Bearer ${getAccessToken()}`;
+        })
+        .finally(() => {
+          delete ctx.proxyToServerRequestOptions.headers["x-api-key"];
+          delete ctx.proxyToServerRequestOptions.headers["x-forwarded-for"];
+          delete ctx.proxyToServerRequestOptions.headers["x-real-ip"];
 
-      // Redact emails in request body before forwarding to Anthropic
-      if (method === "POST" && hostname === "api.anthropic.com") {
-        delete ctx.proxyToServerRequestOptions.headers["content-length"];
-        ctx.proxyToServerRequestOptions.headers["transfer-encoding"] = "chunked";
-        const chunks: Buffer[] = [];
-        ctx.addRequestFilter(
-          new Transform({
-            transform(chunk, _enc, done) {
-              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-              done();
-            },
-            flush(done) {
-              const body = Buffer.concat(chunks).toString("utf8");
-              let redacted = body;
-              try {
-                const parsed = JSON.parse(body);
-                const redactedObj = redactEmails(parsed);
-                redacted = JSON.stringify(redactedObj);
-              } catch (err) {
-                // Fallback to regex replace if body is not valid JSON
-                redacted = body.replace(EMAIL_RE, "[REDACTED]");
-              }
-              ctx[CTX_REQUEST_BODY] = redacted;
-              this.push(Buffer.from(redacted));
-              done();
-            },
-          }),
-        );
-      }
+          // Redact emails in request body before forwarding to Anthropic
+          if (method === "POST" && hostname === "api.anthropic.com") {
+            delete ctx.proxyToServerRequestOptions.headers["content-length"];
+            ctx.proxyToServerRequestOptions.headers["transfer-encoding"] = "chunked";
+            const chunks: Buffer[] = [];
+            ctx.addRequestFilter(
+              new Transform({
+                transform(chunk, _enc, done) {
+                  chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                  done();
+                },
+                flush(done) {
+                  const body = Buffer.concat(chunks).toString("utf8");
+                  let redacted = body;
+                  try {
+                    const parsed = JSON.parse(body);
+                    const redactedObj = redactEmails(parsed);
+                    redacted = JSON.stringify(redactedObj);
+                  } catch (err) {
+                    // Fallback to regex replace if body is not valid JSON
+                    redacted = body.replace(EMAIL_RE, "[REDACTED]");
+                  }
+                  ctx[CTX_REQUEST_BODY] = redacted;
+                  this.push(Buffer.from(redacted));
+                  done();
+                },
+              }),
+            );
+          }
 
-      callback();
+          callback();
+        });
     });
 
     proxy.onResponse((ctx: any, callback: () => void) => {

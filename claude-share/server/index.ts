@@ -25,7 +25,7 @@ import {
 import { getTotalStats, getMachineStats } from "../proxy/tokenCounter";
 import { getEntries } from "../proxy/requestLog";
 import { readUsageEvents, byModel } from "../proxy/usageLog";
-import { getAccessToken } from "../proxy/token";
+import { getFreshAccessToken } from "../proxy/token";
 import {
   isRecording,
   setRecording,
@@ -1300,7 +1300,7 @@ export function createApiApp(
     try {
       const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
         headers: {
-          authorization: `Bearer ${getAccessToken()}`,
+          authorization: `Bearer ${await getFreshAccessToken()}`,
           "anthropic-beta": "oauth-2025-04-20",
           "anthropic-version": "2023-06-01",
         },
@@ -1359,7 +1359,7 @@ export function createApiApp(
     if (!flow) return c.text("Not found", 404);
     try {
       const headers: Record<string, string> = {
-        authorization: `Bearer ${getAccessToken()}`,
+        authorization: `Bearer ${await getFreshAccessToken()}`,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       };
