@@ -346,7 +346,10 @@ export async function launchClaude(
   const spawnArgs = ["--settings", connectSettingsPath, ...claudeArgs].map(shellQuote);
 
   const child = spawn("claude", spawnArgs, {
-    stdio: "inherit",
+    // stdin/stdout stay attached to the terminal so Claude's TUI renders as
+    // normal; stderr is piped so a fast crash (bad --settings path, missing
+    // deps, …) leaves a diagnosable reason in the log instead of a silent 0m 0s.
+    stdio: ["inherit", "inherit", "pipe"],
     shell: useShell,
     ...(cwd ? { cwd } : {}),
     env: {
@@ -357,7 +360,17 @@ export async function launchClaude(
     },
   });
 
-  async function cleanupAndExit(code: number | null) {
+  // Forward stderr live (so the user still sees it) while keeping the last ~8KB
+  // to explain a fast exit.
+  let stderrTail = "";
+  if (child.stderr) {
+    child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-8000);
+    });
+  }
+
+  async function cleanupAndExit(code: number | null, signal: NodeJS.Signals | null = null) {
     // Do this first — the network call below can take up to 5s, and until
     // this runs, leftover mouse-tracking modes spam the terminal on every
     // mouse move.
@@ -375,15 +388,34 @@ export async function launchClaude(
     try {
       fs.unlinkSync(tmpCert);
     } catch {}
-    const duration = Math.floor((Date.now() - startTime) / 1000);
+    const durationMs = Date.now() - startTime;
+    const duration = Math.floor(durationMs / 1000);
     const mins = Math.floor(duration / 60);
     const secs = duration % 60;
     p.log.info(`Session ended. Duration: ${mins}m ${secs}s`);
+
+    // A near-instant exit almost always means Claude failed to start (bad
+    // --settings path, missing claude, crash). Surface the captured reason.
+    if (durationMs < 2000 || (code !== 0 && code !== null)) {
+      const reason = stderrTail.trim();
+      logger.error(
+        `claude exited fast: code=${code}, signal=${signal ?? "none"}, ${durationMs}ms` +
+          (reason ? `\n--- claude stderr (tail) ---\n${reason}` : " — no stderr captured"),
+      );
+      if (durationMs < 2000) {
+        p.log.warn(
+          `Claude exited immediately (code ${code}).` +
+            (reason
+              ? `\n${reason}`
+              : " No stderr captured — see ~/.claude-share/logs/connect.log."),
+        );
+      }
+    }
     process.exit(code ?? 0);
   }
 
-  child.on("exit", (code) => {
-    void cleanupAndExit(code);
+  child.on("exit", (code, signal) => {
+    void cleanupAndExit(code, signal);
   });
 
   child.on("error", (err) => {
