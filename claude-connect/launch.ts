@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import { promisify } from "node:util";
 
 import * as p from "@clack/prompts";
@@ -244,7 +245,18 @@ export async function sessionPost(
     timeout: 5_000,
     ca: caPem,
   });
-  return r.ok ? (r.json() as Promise<Record<string, unknown>>) : {};
+  if (!r.ok) {
+    // Surface why the sharer rejected us (e.g. 403 policy, 502 tunnel) instead
+    // of silently returning {} — that's what turns into "no sessionId".
+    let detail = "";
+    try {
+      const b = await r.json();
+      detail = typeof b === "string" ? b : JSON.stringify(b);
+    } catch {}
+    logger.warn(`${endpoint} failed: HTTP ${r.status}${detail ? ` — ${detail.slice(0, 300)}` : ""}`);
+    return {};
+  }
+  return r.json() as Promise<Record<string, unknown>>;
 }
 
 // ── Launch ────────────────────────────────────────────────────────────────────
@@ -285,8 +297,15 @@ export async function launchClaude(
     );
   }
 
+  // NODE_EXTRA_CA_CERTS must contain BOTH the MITM CA (to trust intercepted
+  // api.anthropic.com) AND the standard root CAs (so Claude's own tools — e.g.
+  // the Fetch/WebFetch tool hitting real sites through the transparent tunnel —
+  // still verify normal certs). Bun (Claude's runtime) treats this env var as
+  // *replacing* the trust store rather than extending it, so a file with only
+  // the MITM CA makes every non-Anthropic HTTPS fetch fail with an SSL error.
   const tmpCert = path.join(os.tmpdir(), `claude-share-ca-${Date.now()}.pem`);
-  fs.writeFileSync(tmpCert, caPem, { mode: 0o600 });
+  const caBundle = [caPem.trim(), ...tls.rootCertificates].join("\n") + "\n";
+  fs.writeFileSync(tmpCert, caBundle, { mode: 0o600 });
 
   const proxyAuth =
     "Basic " +

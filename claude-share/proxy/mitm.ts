@@ -599,6 +599,12 @@ export async function createMitmProxy(
       (req: any, socket: any, head: any, callback: () => void) => {
         const connectAuth = req.headers["proxy-authorization"] ?? "";
         if (!checkAuth(connectAuth)) {
+          // Surface rejected tunnels on the dashboard — otherwise a receiver with
+          // a stale/invalid proxyPass (407) fails completely invisibly, since
+          // logRequest normally only runs after CONNECT is authorized.
+          const target = ((req.url as string) ?? "").split(":")[0] || "unknown";
+          const id = logRequest("CONNECT", target, "(proxy auth rejected)", "blocked");
+          setResponseStatus(id, 407);
           socket.write(
             "HTTP/1.1 407 Proxy Authentication Required\r\n" +
               'Proxy-Authenticate: Basic realm="claude-share"\r\n' +
