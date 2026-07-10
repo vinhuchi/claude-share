@@ -171,6 +171,10 @@ export async function createMitmProxy(
         !ctx[CTX_RETRIED]
       ) {
         ctx[CTX_RETRIED] = true;
+        logger.warn(
+          `[mitm] ECONNRESET (stale keep-alive) on ${method ?? "?"} ` +
+            `${ctx?.clientToProxyRequest?.url ?? "?"} — retrying once on fresh connection`,
+        );
         retryOnFreshConnection(ctx);
         return;
       }
@@ -187,6 +191,10 @@ export async function createMitmProxy(
         const retryReq = transport.request(options, (retryRes: any) => {
           const clientRes = ctx.proxyToClientResponse;
           if (!clientRes || clientRes.headersSent) return;
+          logger.info(
+            `[mitm] retry succeeded (HTTP ${retryRes.statusCode}) on ` +
+              `${ctx?.clientToProxyRequest?.url ?? "?"}`,
+          );
           const headers = { ...retryRes.headers };
           delete headers["authorization"];
           delete headers["set-cookie"];
@@ -196,7 +204,11 @@ export async function createMitmProxy(
           retryRes.pipe(clientRes);
         });
         retryReq.on("error", (retryErr: Error) => {
-          logger.error("[mitm] retry on fresh connection failed", retryErr);
+          const rc = (retryErr as NodeJS.ErrnoException)?.code ?? "ERR";
+          logger.error(
+            `[mitm] retry on fresh connection failed: code=${rc} ` +
+              `${ctx?.clientToProxyRequest?.url ?? "?"} — ${retryErr.message}`,
+          );
           _origOnError("PROXY_TO_SERVER_REQUEST_ERROR", ctx, retryErr);
         });
         if (typeof body === "string") {
@@ -218,7 +230,44 @@ export async function createMitmProxy(
 
     proxy.onError((ctx: any, err: any) => {
       if (!err) return;
-      logger.error("[mitm] proxy error", err);
+      const code = (err as NodeJS.ErrnoException)?.code ?? "ERR";
+      const host = (ctx?.clientToProxyRequest?.headers?.host ?? "").split(":")[0] || "unknown";
+      const method = ctx?.clientToProxyRequest?.method ?? "";
+      const reqPath = ctx?.clientToProxyRequest?.url ?? "";
+      const retried = ctx?.[CTX_RETRIED] ? " (after retry)" : "";
+      logger.error(
+        `[mitm] proxy error: code=${code} ${method} ${host}${reqPath}${retried} — ${err?.message ?? err}`,
+      );
+
+      // A proxy error with no HTTP response is otherwise invisible on the
+      // dashboard (only >=400 responses get an error log). Surface real failures
+      // to api.anthropic.com so they show up in the Errors tab for debugging.
+      const clientAwaiting =
+        ctx?.proxyToClientResponse && !ctx.proxyToClientResponse.headersSent;
+      if (clientAwaiting && host === "api.anthropic.com") {
+        const logId = ctx?.[CTX_LOG_ID];
+        if (logId !== undefined) setResponseStatus(logId, 502);
+        try {
+          const logDir = path.join(os.homedir(), ".claude-share", "logs");
+          fs.mkdirSync(logDir, { recursive: true });
+          const logFilename = `api-error-conn-${Date.now()}.log`;
+          const reqBody = ctx?.[CTX_REQUEST_BODY] ?? "(not captured)";
+          const content = [
+            `TIMESTAMP: ${new Date().toISOString()}`,
+            `METHOD: ${method}`,
+            `PATH: ${reqPath}`,
+            `ERROR: connection/proxy error (no HTTP response reached the client)`,
+            `ERROR CODE: ${code}`,
+            `RETRIED: ${ctx?.[CTX_RETRIED] ? "yes" : "no"}`,
+            `ERROR MESSAGE: ${err?.message ?? String(err)}`,
+            `REQUEST BODY (FIRST 5000 CHARS):\n${String(reqBody).slice(0, 5000)}`,
+          ].join("\n\n");
+          fs.writeFileSync(path.join(logDir, logFilename), content, "utf8");
+          if (logId !== undefined) setErrorLogFile(logId, logFilename);
+        } catch (logErr) {
+          logger.error("[mitm] failed to write connection error log", logErr);
+        }
+      }
     });
 
     proxy.onRequest((ctx: any, callback: () => void) => {

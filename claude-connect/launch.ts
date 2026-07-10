@@ -311,6 +311,13 @@ export async function launchClaude(
     "Basic " +
     Buffer.from(`${meta.proxyUser}:${meta.proxyPass}`).toString("base64");
 
+  // Context line so every session's log entries are attributable when debugging.
+  try {
+    logger.info(
+      `Session context: proxy=${new URL(proxyUrl).host} machineId=${meta.id}`,
+    );
+  } catch {}
+
   // Register this Claude session with the sharer
   let sessionId: string | null = null;
   try {
@@ -330,7 +337,10 @@ export async function launchClaude(
     logger.error("session/start failed", err);
   }
 
-  // 30-second heartbeat so sharer sees lastActiveAt update
+  // 30-second heartbeat so sharer sees lastActiveAt update. A broken tunnel
+  // (ECONNRESET etc.) shows up here first — log the transition to failing/
+  // recovered once each instead of silently swallowing or spamming every 30s.
+  let heartbeatFailing = false;
   const heartbeat = sessionId
     ? setInterval(() => {
         void sessionPost(
@@ -342,7 +352,21 @@ export async function launchClaude(
           },
           caPem,
           proxyAuth,
-        ).catch(() => {});
+        )
+          .then(() => {
+            if (heartbeatFailing) {
+              heartbeatFailing = false;
+              logger.info("heartbeat recovered");
+            }
+          })
+          .catch((err) => {
+            if (!heartbeatFailing) {
+              heartbeatFailing = true;
+              logger.warn(
+                `heartbeat connection failed (tunnel/proxy): ${(err as Error)?.message ?? err}`,
+              );
+            }
+          });
       }, 30_000)
     : null;
 
