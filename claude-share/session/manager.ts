@@ -153,6 +153,10 @@ export function removeMachine(session: Session, machineId: string): boolean {
 
 /** Returns true if the Proxy-Authorization header matches any active machine. */
 export function checkMachineAuth(session: Session, authHeader: string): boolean {
+  // Enforce expiry at the single auth chokepoint used by BOTH the API middleware
+  // and the MITM CONNECT path — otherwise receivers keep working for up to the
+  // 60s expiry-interval past sharedUntil, then get cut abruptly mid-request.
+  if (isSessionExpired(session)) return false;
   for (const machine of session.machines.values()) {
     const expected = "Basic " + Buffer.from(`${machine.id}:${machine.proxyPass}`).toString("base64");
     if (authHeader === expected) return true;

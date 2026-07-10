@@ -42,10 +42,28 @@ export interface ModelUsage {
   requests: number;
 }
 
+// Cap the ledger so a long-running (esp. Unlimited) share doesn't grow it
+// without bound — readUsageEvents() reads the whole file synchronously on the
+// dashboard hot path, so an ever-growing file slowly wedges the event loop.
+const MAX_BYTES = 8 * 1024 * 1024; // ~8MB
+let appendsSinceCheck = 0;
+
+function maybePrune(): void {
+  if (++appendsSinceCheck < 200) return;
+  appendsSinceCheck = 0;
+  try {
+    if (fs.statSync(USAGE_LOG).size <= MAX_BYTES) return;
+    const lines = fs.readFileSync(USAGE_LOG, "utf8").split("\n").filter(Boolean);
+    const kept = lines.slice(Math.floor(lines.length / 2)); // drop oldest half
+    fs.writeFileSync(USAGE_LOG, kept.join("\n") + "\n", { mode: 0o600 });
+  } catch {}
+}
+
 export function recordUsageEvent(ev: UsageEvent): void {
   try {
     fs.mkdirSync(path.dirname(USAGE_LOG), { recursive: true });
     fs.appendFileSync(USAGE_LOG, JSON.stringify(ev) + "\n", { mode: 0o600 });
+    maybePrune();
   } catch {}
 }
 

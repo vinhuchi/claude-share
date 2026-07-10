@@ -17,5 +17,4 @@ export interface SavedConnection {
 
 export interface ReceiverConfig {
   deviceName: string;
-  hasConnectTermsAgreed?: boolean;
 }

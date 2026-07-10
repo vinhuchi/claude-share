@@ -20,23 +20,6 @@ import { resolveMachineId } from "../session/manager";
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
-function redactEmails(obj: any): any {
-  if (typeof obj === "string") {
-    return obj.replace(EMAIL_RE, "[REDACTED]");
-  }
-  if (Array.isArray(obj)) {
-    return obj.map(redactEmails);
-  }
-  if (obj && typeof obj === "object") {
-    const res: any = {};
-    for (const key of Object.keys(obj)) {
-      res[key] = redactEmails(obj[key]);
-    }
-    return res;
-  }
-  return obj;
-}
-
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const CTX_REQUEST_BODY = Symbol("requestBody");
@@ -70,6 +53,10 @@ const API_ALLOWED_PATHS: Array<{ method: string | null; prefix: string }> = [
   // per-model incl. Fable). Allowing it lets the receiver run `/usage` and lets
   // the dashboard show the sharer's real utilization.
   { method: "GET", prefix: "/api/oauth/usage" },
+  // GrowthBook feature flags the CLI fetches at startup (Anthropic's own
+  // endpoint). Blocking it 403s on every receiver launch (dashboard noise) and
+  // leaves the client on default flags (e.g. it won't self-disable keepalive).
+  { method: "GET", prefix: "/api/features" },
   // WebFetch preflight domain-reputation check — blocking it makes Claude Code
   // report "Unable to verify if domain X is safe to fetch" for every WebFetch.
   { method: "GET", prefix: "/api/web/domain_info" },
@@ -99,6 +86,44 @@ function isPlatformAnthropicAllowed(reqPath: string): boolean {
 // platform.claude.com allowed paths
 function isPlatformClaudeAllowed(reqPath: string): boolean {
   return reqPath.startsWith("/v1/oauth/");
+}
+
+// Which hop an http-mitm-proxy error `kind` belongs to, so logs make it obvious
+// whether to look at the upstream (proxy↔Anthropic) or the tunnel to the
+// receiver (client↔bore↔sharer) without guessing.
+function errorLeg(kind: string | undefined): string {
+  if (!kind) return "unknown-leg";
+  if (kind.startsWith("PROXY_TO_SERVER")) return "proxy→Anthropic (upstream)";
+  if (kind.startsWith("CLIENT_TO_PROXY") || kind.startsWith("HTTPS_CLIENT"))
+    return "receiver→bore→sharer (downstream)";
+  return kind;
+}
+
+// Keep only the newest N api-error-*.log files. Without this, a flaky upstream
+// (repeated 401/5xx) fills ~/.claude-share/logs with thousands of files that the
+// dashboard readdir()s every ~3s — an unbounded synchronous scan that degrades
+// the server the longer it runs. Throttled so a burst doesn't stat every write.
+let errorLogWrites = 0;
+function pruneErrorLogs(logDir: string, keep = 300): void {
+  if (++errorLogWrites % 25 !== 0) return;
+  try {
+    const files = fs
+      .readdirSync(logDir)
+      .filter((f) => f.startsWith("api-error-") && f.endsWith(".log"))
+      .map((f) => {
+        let t = 0;
+        try {
+          t = fs.statSync(path.join(logDir, f)).mtimeMs;
+        } catch {}
+        return { f, t };
+      })
+      .sort((a, b) => a.t - b.t);
+    for (const { f } of files.slice(0, Math.max(0, files.length - keep))) {
+      try {
+        fs.unlinkSync(path.join(logDir, f));
+      } catch {}
+    }
+  } catch {}
 }
 
 export interface MitmProxy {
@@ -146,7 +171,13 @@ export async function createMitmProxy(
     const _origOnError = (proxy as any)._onError.bind(proxy);
     (proxy as any)._onError = (kind: string, ctx: any, err: Error) => {
       const code = (err as NodeJS.ErrnoException)?.code;
-      const isBenign = code === "ECONNRESET" || code === "HPE_INVALID_EOF_STATE";
+      // EPIPE is the other half of a dead keep-alive socket — Claude Code's own
+      // client treats ECONNRESET and EPIPE identically (withRetry isStaleConnectionError).
+      const isBenign =
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "HPE_INVALID_EOF_STATE";
+      // Retry is only possible before any response bytes reach the client.
       const clientAwaitingResponse =
         ctx?.proxyToClientResponse && !ctx.proxyToClientResponse.headersSent;
 
@@ -165,21 +196,35 @@ export async function createMitmProxy(
 
       if (
         kind === "PROXY_TO_SERVER_REQUEST_ERROR" &&
-        code === "ECONNRESET" &&
+        (code === "ECONNRESET" || code === "EPIPE") &&
         clientAwaitingResponse &&
         bodyReplayable &&
         !ctx[CTX_RETRIED]
       ) {
         ctx[CTX_RETRIED] = true;
         logger.warn(
-          `[mitm] ECONNRESET (stale keep-alive) on ${method ?? "?"} ` +
-            `${ctx?.clientToProxyRequest?.url ?? "?"} — retrying once on fresh connection`,
+          `[mitm] leg=${errorLeg(kind)} ${code} (stale keep-alive) on ` +
+            `${method ?? "?"} ${ctx?.clientToProxyRequest?.url ?? "?"} — retrying once on fresh connection`,
         );
         retryOnFreshConnection(ctx);
         return;
       }
 
-      if (isBenign && !clientAwaitingResponse) return;
+      // Only swallow a benign reset when there is genuinely no client to answer:
+      // an orphaned pooled socket (no proxyToClientResponse), an already-finished
+      // response, or a client that already left/aborted. If the client is STILL
+      // connected — including mid-stream after headers were sent — do NOT swallow:
+      // let the library terminate the response (504 pre-headers, .end() mid-stream)
+      // so the receiver's stream fails fast and retries instead of hanging until
+      // its body timeout.
+      const clientRes = ctx?.proxyToClientResponse;
+      const clientGone =
+        !clientRes ||
+        clientRes.writableEnded === true ||
+        clientRes.finished === true ||
+        ctx?.clientToProxyRequest?.aborted === true ||
+        ctx?.clientToProxyRequest?.destroyed === true;
+      if (isBenign && clientGone) return;
       _origOnError(kind, ctx, err);
     };
 
@@ -206,8 +251,8 @@ export async function createMitmProxy(
         retryReq.on("error", (retryErr: Error) => {
           const rc = (retryErr as NodeJS.ErrnoException)?.code ?? "ERR";
           logger.error(
-            `[mitm] retry on fresh connection failed: code=${rc} ` +
-              `${ctx?.clientToProxyRequest?.url ?? "?"} — ${retryErr.message}`,
+            `[mitm] leg=proxy→Anthropic (upstream) retry on fresh connection failed: ` +
+              `code=${rc} ${ctx?.clientToProxyRequest?.url ?? "?"} — ${retryErr.message}`,
           );
           _origOnError("PROXY_TO_SERVER_REQUEST_ERROR", ctx, retryErr);
         });
@@ -228,15 +273,32 @@ export async function createMitmProxy(
       }
     }
 
-    proxy.onError((ctx: any, err: any) => {
+    proxy.onError((ctx: any, err: any, kind?: string) => {
       if (!err) return;
       const code = (err as NodeJS.ErrnoException)?.code ?? "ERR";
       const host = (ctx?.clientToProxyRequest?.headers?.host ?? "").split(":")[0] || "unknown";
       const method = ctx?.clientToProxyRequest?.method ?? "";
       const reqPath = ctx?.clientToProxyRequest?.url ?? "";
       const retried = ctx?.[CTX_RETRIED] ? " (after retry)" : "";
+      const leg = errorLeg(kind);
+
+      // Benign: the receiver's client cancelled the request (user pressed Esc,
+      // Claude aborted a stream). Node surfaces this as ECONNRESET "aborted"
+      // with the client request already aborted/destroyed. It's not a failure —
+      // log it quietly and keep it off the dashboard Errors tab as noise.
+      const clientAborted =
+        ctx?.clientToProxyRequest?.aborted === true ||
+        ctx?.clientToProxyRequest?.destroyed === true ||
+        String(err?.message) === "aborted";
+      if (clientAborted) {
+        logger.info(
+          `[mitm] request cancelled by client (benign) ${method} ${host}${reqPath} — ${err?.message ?? err}`,
+        );
+        return;
+      }
+
       logger.error(
-        `[mitm] proxy error: code=${code} ${method} ${host}${reqPath}${retried} — ${err?.message ?? err}`,
+        `[mitm] leg=${leg} kind=${kind ?? "?"} code=${code} ${method} ${host}${reqPath}${retried} — ${err?.message ?? err}`,
       );
 
       // A proxy error with no HTTP response is otherwise invisible on the
@@ -257,13 +319,19 @@ export async function createMitmProxy(
             `METHOD: ${method}`,
             `PATH: ${reqPath}`,
             `ERROR: connection/proxy error (no HTTP response reached the client)`,
+            `LEG: ${leg} (kind=${kind ?? "?"})`,
             `ERROR CODE: ${code}`,
             `RETRIED: ${ctx?.[CTX_RETRIED] ? "yes" : "no"}`,
             `ERROR MESSAGE: ${err?.message ?? String(err)}`,
             `REQUEST BODY (FIRST 5000 CHARS):\n${String(reqBody).slice(0, 5000)}`,
           ].join("\n\n");
-          fs.writeFileSync(path.join(logDir, logFilename), content, "utf8");
+          // async: this fires precisely when the upstream is already unhealthy
+          // (429/529 storms), so a sync write here would stall all proxied traffic.
+          fs.writeFile(path.join(logDir, logFilename), content, "utf8", (e) => {
+            if (e) logger.error("[mitm] failed to write connection error log", e);
+          });
           if (logId !== undefined) setErrorLogFile(logId, logFilename);
+          pruneErrorLogs(logDir);
         } catch (logErr) {
           logger.error("[mitm] failed to write connection error log", logErr);
         }
@@ -380,15 +448,15 @@ export async function createMitmProxy(
                 },
                 flush(done) {
                   const body = Buffer.concat(chunks).toString("utf8");
-                  let redacted = body;
-                  try {
-                    const parsed = JSON.parse(body);
-                    const redactedObj = redactEmails(parsed);
-                    redacted = JSON.stringify(redactedObj);
-                  } catch (err) {
-                    // Fallback to regex replace if body is not valid JSON
-                    redacted = body.replace(EMAIL_RE, "[REDACTED]");
-                  }
+                  // Redact on the raw string — do NOT JSON.parse/stringify. That
+                  // round-trip silently corrupts integer literals > 2^53 (64-bit
+                  // IDs, DB bigints) a receiver may include in a message, so
+                  // Anthropic would receive a different number than was sent. The
+                  // regex only rewrites email-looking substrings; includes("@")
+                  // skips the scan entirely for the common case.
+                  const redacted = body.includes("@")
+                    ? body.replace(EMAIL_RE, "[REDACTED]")
+                    : body;
                   ctx[CTX_REQUEST_BODY] = redacted;
                   resolveBodyReady(redacted);
                   this.push(Buffer.from(redacted));
@@ -460,10 +528,13 @@ export async function createMitmProxy(
                   `REQUEST BODY (FULL):\n${reqBody}`,
                 ].join("\n\n");
 
-                fs.writeFileSync(logPath, logContent, "utf8");
+                fs.writeFile(logPath, logContent, "utf8", (e) => {
+                  if (e) logger.error("[mitm] failed to write API error log", e);
+                }); // async: off the proxy hot path
                 if (logId !== undefined) {
                   setErrorLogFile(logId, logFilename);
                 }
+                pruneErrorLogs(logDir);
                 logger.error(`[mitm] API ${status} error. Logged request/response to ${logPath}`);
               } catch (logErr) {
                 logger.error("[mitm] failed to write API error log", logErr);
@@ -680,15 +751,28 @@ export async function createMitmProxy(
         // The client's TLS handshake goes straight to the real server.
         const port = parseInt(portStr, 10) || 443;
         socket.setNoDelay(true);
+        // Bound the CONNECT phase: an upstream host whose IP blackholes would
+        // otherwise sit in SYN_SENT holding both FDs until the OS TCP timeout
+        // (~127s). Cleared once connected.
+        const connectTimer = setTimeout(
+          () => upstream.destroy(new Error("connect timeout")),
+          10_000,
+        );
+        connectTimer.unref?.();
         const upstream = net.connect(port, hostname, () => {
+          clearTimeout(connectTimer);
           upstream.setNoDelay(true);
           socket.write("HTTP/1.1 200 Connection established\r\n\r\n");
           if (head?.length) upstream.write(head);
           upstream.pipe(socket);
           socket.pipe(upstream);
         });
-        upstream.on("error", () => socket.destroy());
+        upstream.on("error", () => {
+          clearTimeout(connectTimer);
+          socket.destroy();
+        });
         socket.on("error", () => upstream.destroy());
+        socket.on("close", () => upstream.destroy());
       },
     );
 
@@ -732,8 +816,13 @@ export async function createMitmProxy(
               }
             },
             close() {
+              // Do NOT delete sslCaDir here: it's the PERSISTENT MITM CA
+              // (~/.claude-share/mitm-ca) that every receiver's saved caPem is
+              // pinned to. Wiping it on shutdown (cleanup runs on SIGINT/SIGTERM/
+              // expiry/EMFILE) rotates the CA on the next start → all receivers
+              // get SSL verification failures until they re-pair. (Leftover from
+              // when sslCaDir was a per-run temp dir.)
               proxy.close();
-              fs.rm(sslCaDir, { recursive: true, force: true }, () => {});
             },
           });
         })().catch(reject);

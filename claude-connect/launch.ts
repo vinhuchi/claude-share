@@ -253,8 +253,10 @@ export async function sessionPost(
       const b = await r.json();
       detail = typeof b === "string" ? b : JSON.stringify(b);
     } catch {}
-    logger.warn(`${endpoint} failed: HTTP ${r.status}${detail ? ` — ${detail.slice(0, 300)}` : ""}`);
-    return {};
+    logger.warn(`[leg: receiver→bore→sharer] ${endpoint} failed: HTTP ${r.status}${detail ? ` — ${detail.slice(0, 300)}` : ""}`);
+    // Surface the status so callers can distinguish a definitive "stale creds"
+    // 407 from a transient failure without re-issuing the request.
+    return { _status: r.status };
   }
   return r.json() as Promise<Record<string, unknown>>;
 }
@@ -318,8 +320,24 @@ export async function launchClaude(
     );
   } catch {}
 
-  // Register this Claude session with the sharer
+  // Register this Claude session with the sharer.
+  // A 407 (stale proxyPass) or a TLS-cert mismatch (stale caPem / rotated CA)
+  // means this saved connection is dead — don't spawn Claude against a proxy
+  // that will reject or SSL-fail every request (which just looks like a hang /
+  // "offline"). Fail fast and tell the user to grab a fresh connect link.
   let sessionId: string | null = null;
+  const abortStale = (reason: string): never => {
+    resetTerminalModes();
+    p.log.error(
+      `${reason}\nYour saved connection is no longer valid — the sharer restarted, ` +
+        "re-shared, or revoked this device. Get a FRESH connect link and run:\n" +
+        '  claude-connect --share "<new url>"',
+    );
+    try {
+      fs.unlinkSync(tmpCert);
+    } catch {}
+    process.exit(1);
+  };
   try {
     const res = await sessionPost(
       proxyUrl,
@@ -328,13 +346,24 @@ export async function launchClaude(
       caPem,
       proxyAuth,
     );
+    if (res["_status"] === 407) {
+      abortStale("Proxy rejected your credentials (HTTP 407).");
+    }
     sessionId = (res["sessionId"] as string) ?? null;
     if (!sessionId)
-      logger.warn("session/start returned no sessionId", {
+      logger.warn("[leg: receiver→bore→sharer] session/start returned no sessionId", {
         machineId: meta.id,
       });
   } catch (err) {
-    logger.error("session/start failed", err);
+    const code = (err as NodeJS.ErrnoException)?.code ?? "";
+    const msg = String((err as Error)?.message ?? err);
+    if (
+      /^(UNABLE_TO|SELF_SIGNED|CERT_|DEPTH_ZERO|ERR_TLS)/.test(code) ||
+      /certificate|self.signed|unable to (verify|get local issuer)|SSL/i.test(msg)
+    ) {
+      abortStale("TLS certificate mismatch — the sharer's proxy identity changed since you paired.");
+    }
+    logger.error("[leg: receiver→bore→sharer] session/start failed", err);
   }
 
   // 30-second heartbeat so sharer sees lastActiveAt update. A broken tunnel
@@ -363,7 +392,7 @@ export async function launchClaude(
             if (!heartbeatFailing) {
               heartbeatFailing = true;
               logger.warn(
-                `heartbeat connection failed (tunnel/proxy): ${(err as Error)?.message ?? err}`,
+                `[leg: receiver→bore→sharer] heartbeat connection failed (tunnel/proxy): ${(err as Error)?.message ?? err}`,
               );
             }
           });

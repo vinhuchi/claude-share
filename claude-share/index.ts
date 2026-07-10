@@ -2,6 +2,7 @@
 import "@shared/patch-console";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -26,13 +27,26 @@ if (process.argv.includes("-v") || process.argv.includes("--version")) {
   process.exit(0);
 }
 
+// main() assigns this to its cleanup() once the tunnel/servers exist. The
+// uncaught handlers below are registered at module load (before main runs), so
+// without this hook they exit(1) WITHOUT tearing anything down — orphaning the
+// non-detached bore child, which keeps the saved port registration and forces
+// the restarted sharer onto a new public URL (receivers then see "offline").
+let fatalCleanup: (() => void) | null = null;
+
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception", err);
+  try {
+    fatalCleanup?.();
+  } catch {}
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
   logger.error("Unhandled rejection", reason);
+  try {
+    fatalCleanup?.();
+  } catch {}
   process.exit(1);
 });
 
@@ -41,6 +55,8 @@ platform();
 
 import { createPortDetector } from "./port/detector";
 import { createMitmProxy } from "./proxy/mitm";
+import { getEntries } from "./proxy/requestLog";
+import { flushPendingSave } from "./proxy/tokenCounter";
 import { initToken, stopTokenRefresh } from "./proxy/token";
 import { createApiApp } from "./server/index";
 import {
@@ -58,39 +74,6 @@ import {
 import { App } from "./tui/App";
 import { isBoreInstalled, installBore, startTunnel } from "./tunnel/index";
 import { verifyTokenOrExit } from "./proxy/verifyToken";
-
-const CLAUDE_SHARE_CONFIG = path.join(
-  os.homedir(),
-  ".claude-share",
-  "config.json",
-);
-
-function hasAgreedToTerms(): boolean {
-  try {
-    const cfg = JSON.parse(
-      fs.readFileSync(CLAUDE_SHARE_CONFIG, "utf8"),
-    ) as Record<string, unknown>;
-    return cfg["hasShareTermsAgreed"] === true;
-  } catch {
-    return false;
-  }
-}
-
-function saveTermsAgreed(): void {
-  const dir = path.dirname(CLAUDE_SHARE_CONFIG);
-  fs.mkdirSync(dir, { recursive: true });
-  let cfg: Record<string, unknown> = {};
-  try {
-    cfg = JSON.parse(fs.readFileSync(CLAUDE_SHARE_CONFIG, "utf8")) as Record<
-      string,
-      unknown
-    >;
-  } catch {}
-  cfg["hasShareTermsAgreed"] = true;
-  fs.writeFileSync(CLAUDE_SHARE_CONFIG, JSON.stringify(cfg, null, 2), {
-    mode: 0o600,
-  });
-}
 
 function readSharerAccount(): SharerAccount | null {
   try {
@@ -178,34 +161,6 @@ async function main() {
     process.argv.includes("--headless");
 
   p.intro("claude-share");
-
-  if (!hasAgreedToTerms()) {
-    if (isHeadless) {
-      process.stderr.write(
-        "[claude-share] ERROR: Terms not yet agreed. Run interactively once first to accept terms.\n",
-      );
-      process.exit(1);
-    }
-    p.log.warn(
-      "Heads up: You're sharing your Claude Code at your own risk.\n" +
-        "This is an open-source project and we are not liable for any damage or\n" +
-        "suspension of your Claude Code subscription. Make sure you trust the\n" +
-        "person you are sharing your subscription with.\n\n" +
-        "This CLI is built to share your Claude Code with a few friends in need.\n" +
-        "Sharing it with a lot of people can be a direct recipe for an account ban.\n" +
-        "We love Claude Code and the purpose of this CLI is to help your friends\n" +
-        "sometimes when they've hit their limit or just want to try it out.",
-    );
-    const agreed = await p.confirm({
-      message: "Do you understand and want to continue?",
-      initialValue: false,
-    });
-    if (p.isCancel(agreed) || !agreed) {
-      p.cancel("Cancelled.");
-      process.exit(0);
-    }
-    saveTermsAgreed();
-  }
 
   const envTunnel =
     process.env.TUNNEL !== "0" && process.env.TUNNEL !== "false";
@@ -325,11 +280,27 @@ async function main() {
   const systemName = await getSystemName();
 
   // Hono API on a random localhost-only port — not exposed externally
+  // Tunnel state — declared before createApiApp so /health can report it, and
+  // so the auto-respawn/watchdog below can mutate it (bore can die and must be
+  // re-established without a manual pm2 restart).
+  let tunnel: Awaited<ReturnType<typeof startTunnel>> = {
+    publicUrl: null,
+    close: () => {},
+  };
+  let publicUrl: string | null = null;
+  let tunnelDown = false;
+  let tunnelStartedAt: Date | null = null;
+  let rerenderApp: (() => void) | null = null;
+  let tunnelClosing = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectDelay = 1000;
+
   const apiApp = createApiApp(
     urls,
     mitmProxy.caCertPem,
     sharerAccount,
     systemName,
+    () => tunnelDown,
   );
   const API_PORT = await new Promise<number>((resolve, reject) => {
     const srv = net.createServer();
@@ -352,13 +323,22 @@ async function main() {
   const tlsTermServer = tls.createServer(
     { cert: mitmProxy.serverCert.certPem, key: mitmProxy.serverCert.keyPem },
     (tlsSocket) => {
+      // Post-handshake first-byte guard: the detector's 15s timer is cleared on
+      // the raw ClientHello, so a peer that completes the TLS handshake then
+      // sends no application bytes would be held forever (FD leak). Mirror the
+      // detector — drop it after 15s, cleared once we route.
+      const firstByteTimer = setTimeout(() => tlsSocket.destroy(), 15_000);
+      firstByteTimer.unref?.();
+
       tlsSocket.on("error", (err) => {
         if ((err as NodeJS.ErrnoException).code !== "ECONNRESET") {
           logger.error("[tls] socket error", err);
         }
       });
+      tlsSocket.on("close", () => clearTimeout(firstByteTimer));
 
       tlsSocket.once("data", (chunk) => {
+        clearTimeout(firstByteTimer);
         const isConnect = chunk
           .slice(0, 8)
           .toString("ascii")
@@ -373,7 +353,13 @@ async function main() {
           upstream.setNoDelay(true);
           tlsSocket.pipe(upstream);
           upstream.pipe(tlsSocket);
+          // Tear down BOTH sides on either error/close — otherwise a receiver
+          // disconnect leaks the localhost upstream socket to the Hono port
+          // until its timeout (confirmed FD leak under connection churn).
           upstream.on("error", () => tlsSocket.destroy());
+          upstream.on("close", () => tlsSocket.destroy());
+          tlsSocket.on("error", () => upstream.destroy());
+          tlsSocket.on("close", () => upstream.destroy());
         }
       });
     },
@@ -460,50 +446,154 @@ async function main() {
   });
   logger.info(`Listening on port ${PORT}`);
 
-  let tunnel: Awaited<ReturnType<typeof startTunnel>>;
-  let publicUrl: string | null = null;
-  let tunnelDown = false;
-  let tunnelStartedAt: Date | null = null;
-  let rerenderApp: (() => void) | null = null;
+  // The once("error", reject) used for the listen promise is a dead no-op once
+  // listen has resolved, so a later listener error (e.g. EMFILE from FD
+  // exhaustion) would be silently swallowed and wedge the process while pm2
+  // still sees it "online". Attach a live handler: on FD exhaustion, exit so
+  // pm2 restarts cleanly instead of leaving an unreachable server running.
+  detector.on("error", (err: NodeJS.ErrnoException) => {
+    logger.error("[detector] server error", err);
+    if (err.code === "EMFILE" || err.code === "ENFILE") {
+      logger.error(
+        "[detector] file-descriptor exhaustion — exiting for pm2 to restart",
+      );
+      try {
+        cleanup();
+      } catch {}
+      process.exit(1);
+    }
+  });
 
-  if (boreReady) {
-    logger.info("Starting bore tunnel");
+  // (Re)establish the bore tunnel. Called on first start and on every respawn;
+  // saveBorePort() persists the port so a respawn keeps the same public URL and
+  // existing connect links keep working.
+  async function connectTunnel(): Promise<void> {
+    if (tunnelClosing) return;
     try {
-      tunnel = await startTunnel(PORT, () => {
-        tunnelDown = true;
-        logger.error("bore tunnel disconnected unexpectedly");
-        rerenderApp?.();
-      });
+      tunnel = await startTunnel(PORT, onTunnelDown);
       publicUrl = tunnel.publicUrl;
       urls.public = publicUrl;
       if (publicUrl) {
-        tunnelStartedAt = new Date();
-        logger.info(`Tunnel active: ${publicUrl}`);
+        // If bore listened then died during the await, onTunnelDown already set
+        // tunnelDown and scheduled a reconnect — don't clobber that "up" here
+        // (which would falsely show the tunnel healthy against a dead child).
+        if (!tunnelClosing && !reconnectTimer) {
+          tunnelDown = false;
+          tunnelStartedAt = new Date();
+          reconnectDelay = 1000; // reset backoff on success
+          logger.info(`Tunnel active: ${publicUrl}`);
+        }
       } else {
-        logger.warn(
-          "Unable to generate public URL: bore did not return a port",
-        );
+        logger.warn("bore did not return a port — will retry");
+        scheduleReconnect();
       }
     } catch (err) {
-      logger.warn("Could not start bore tunnel", err);
-      tunnel = { publicUrl: null, close: () => {} };
+      logger.warn("Could not start bore tunnel — will retry", err);
+      scheduleReconnect();
     }
-  } else {
-    tunnel = { publicUrl: null, close: () => {} };
+    rerenderApp?.();
   }
 
+  function onTunnelDown() {
+    if (tunnelClosing) return;
+    tunnelDown = true;
+    logger.error(
+      "[tunnel] leg=receiver→bore→sharer bore disconnected — respawning",
+    );
+    rerenderApp?.();
+    scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
+    if (tunnelClosing || reconnectTimer) return;
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, 30_000); // 1s→2s→…→30s
+    logger.info(`[tunnel] reconnecting in ${Math.round(delay / 1000)}s`);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      try {
+        tunnel.close();
+      } catch {}
+      void connectTunnel();
+    }, delay);
+    reconnectTimer.unref?.();
+  }
+
+  if (boreReady) {
+    logger.info("Starting bore tunnel");
+    await connectTunnel();
+
+    // Watchdog: bore.pub can silently drop the port registration without the
+    // child process exiting (idle timeout), so onTunnelDown never fires. Probe
+    // the PUBLIC url through the tunnel; on repeated failure, force a respawn.
+    let healthFails = 0;
+    const onWatchdogFail = (reason: string) => {
+      healthFails++;
+      logger.warn(`[tunnel] public /health check failed (${healthFails}/3): ${reason}`);
+      if (healthFails >= 3) {
+        healthFails = 0;
+        // Local-liveness guard: if real proxied traffic reached us in the last
+        // 90s, the tunnel is actually alive and the /health probe is just flaky
+        // (a transient public-internet / bore.pub blip). Don't drop the active
+        // receiver's connection with a needless respawn.
+        const entries = getEntries();
+        const lastReqTs = entries.length ? entries[0].ts.getTime() : 0;
+        if (Date.now() - lastReqTs < 90_000) {
+          logger.info("[tunnel] /health probe failing but recent proxied traffic seen — not respawning");
+          return;
+        }
+        logger.error("[tunnel] public URL unreachable — forcing bore respawn");
+        tunnelDown = true;
+        rerenderApp?.();
+        try {
+          tunnel.close();
+        } catch {}
+        scheduleReconnect();
+      }
+    };
+    const watchdog = setInterval(() => {
+      if (tunnelClosing || tunnelDown || !publicUrl) return;
+      const req = https.get(
+        `${publicUrl}/health`,
+        { rejectUnauthorized: false, timeout: 5000 },
+        (res) => {
+          res.resume();
+          const s = res.statusCode ?? 0;
+          if (s >= 200 && s < 500) healthFails = 0;
+          else onWatchdogFail(`HTTP ${s}`);
+        },
+      );
+      req.on("timeout", () => req.destroy(new Error("timeout")));
+      req.on("error", (e) => onWatchdogFail(e.message));
+    }, 45_000);
+    watchdog.unref();
+  }
+
+  let cleanedUp = false;
   function cleanup() {
+    if (cleanedUp) return; // idempotent — now called from SIGINT/SIGTERM/exit/uncaught
+    cleanedUp = true;
+    tunnelClosing = true; // stop auto-respawn/watchdog from fighting shutdown
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     resetTerminalModes();
     mitmProxy.close();
-    tunnel.close();
+    tunnel.close(); // kills the bore child
     detector.close();
     tlsTermServer.close();
     (honoServer as any).close?.();
     stopTokenRefresh();
+    flushPendingSave(); // persist the last debounced token stats before we drop the session
     destroySession();
   }
+  // Let the module-level uncaught handlers tear down (esp. kill bore) too.
+  fatalCleanup = cleanup;
 
-  process.on("exit", resetTerminalModes);
+  // Backstop: guarantee the non-detached bore child dies on ANY exit path
+  // (cleanup is idempotent + sync-safe), so it never orphans and squats the port.
+  process.on("exit", () => {
+    resetTerminalModes();
+    cleanup();
+  });
 
   if (isHeadless) {
     // ── Headless mode: no Ink TUI, log events to stdout ─────────────────────

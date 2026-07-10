@@ -84,14 +84,6 @@ export function getDeviceName(): string {
   return name;
 }
 
-export function hasAgreedToTerms(): boolean {
-  return readConfig()?.hasConnectTermsAgreed === true;
-}
-
-export function saveTermsAgreed(): void {
-  const cfg = readConfig() ?? { deviceName: os.hostname() };
-  writeConfig({ ...cfg, hasConnectTermsAgreed: true });
-}
 
 // ── Connection persistence ────────────────────────────────────────────────────
 
@@ -153,7 +145,7 @@ export function clearActiveConnection(): void {
 
 /**
  * Removes all saved credentials: every connection file, active-connection.json,
- * and the cached ca.pem. Keeps config.json (device name + terms agreement).
+ * and the cached ca.pem. Keeps config.json (device name).
  * Returns how many connection files were removed.
  */
 export function resetAll(): { connections: number } {

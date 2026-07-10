@@ -10,6 +10,31 @@ export interface TokenStats {
 
 const listeners = new Set<() => void>();
 
+// recordTokens runs in the response flush of every billed /v1/messages, and
+// saveSession does a synchronous writeFileSync — writing on every message stalls
+// the event loop under load. Coalesce into at most one write per few seconds;
+// the in-memory stats are always current, only their persistence is debounced.
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSave(session: ReturnType<typeof getSession>): void {
+  if (!session || saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    const s = getSession();
+    if (s) saveSession(s);
+  }, 5000);
+  saveTimer.unref?.();
+}
+
+/** Persist any pending debounced save immediately (call on shutdown). */
+export function flushPendingSave(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  const s = getSession();
+  if (s) saveSession(s);
+}
+
 export function recordTokens(
   machineId: string,
   input: number,
@@ -31,7 +56,7 @@ export function recordTokens(
     requests: machine.stats.requests + 1,
   };
 
-  saveSession(session);
+  scheduleSave(session);
   listeners.forEach((fn) => fn());
 }
 

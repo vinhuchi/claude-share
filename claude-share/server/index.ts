@@ -70,6 +70,7 @@ export function createApiApp(
   caPem: string,
   sharerAccount: SharerAccount | null,
   systemName: string,
+  getTunnelDown: () => boolean = () => false,
 ): Hono {
   const app = new Hono();
 
@@ -95,11 +96,17 @@ export function createApiApp(
 
   app.get("/health", (c) => {
     const session = getSession();
-    return c.json({
-      ok: true,
-      sessionActive: !!session && !isSessionExpired(session),
-      sessionId: session?.id ?? null,
-    });
+    const tunnelDown = getTunnelDown();
+    return c.json(
+      {
+        ok: !tunnelDown,
+        tunnelDown,
+        publicUrl: urls.public,
+        sessionActive: !!session && !isSessionExpired(session),
+        sessionId: session?.id ?? null,
+      },
+      tunnelDown ? 503 : 200,
+    );
   });
 
   /** GET /connect/:code — human-readable hint when someone opens the URL in a browser */
@@ -1127,19 +1134,6 @@ export function createApiApp(
     const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
     const now = Date.now();
 
-    // Check if globally blocked
-    if (globalBlockTime > now) {
-      const remainingSecs = Math.ceil((globalBlockTime - now) / 1000);
-      return c.text(`Too many failed attempts globally. Blocked for another ${remainingSecs} seconds.`, 429);
-    }
-
-    // Check if IP blocked
-    const record = failedLogins.get(ip);
-    if (record && record.blockedUntil > now) {
-      const remainingSecs = Math.ceil((record.blockedUntil - now) / 1000);
-      return c.text(`Too many failed attempts. Blocked for another ${remainingSecs} seconds.`, 429);
-    }
-
     const session = getSession();
     if (!session || isSessionExpired(session)) {
       return c.text("Session expired", 401);
@@ -1149,33 +1143,59 @@ export function createApiApp(
     const adminPass = process.env.DASHBOARD_PASSWORD;
     const isValid = (code && code === session.pairingCode) || (adminPass && code === adminPass);
 
-    if (!isValid) {
-      // 1. Record IP failure
-      const current = failedLogins.get(ip) ?? { count: 0, blockedUntil: 0 };
-      current.count += 1;
-      if (current.count >= 5) {
-        current.blockedUntil = now + 15 * 60 * 1000; // 15 mins block
-        current.count = 0;
-      }
-      failedLogins.set(ip, current);
-
-      // 2. Record Global failure
-      if (globalResetTime < now) {
-        globalFailCount = 0;
-        globalResetTime = now + 5 * 60 * 1000; // 5 mins reset window
-      }
-      globalFailCount += 1;
-      if (globalFailCount >= 15) {
-        globalBlockTime = now + 15 * 60 * 1000; // 15 mins global block
-        globalFailCount = 0;
-      }
-
-      return c.text("Unauthorized", 401);
+    // Validate the code FIRST. A correct code must ALWAYS pass, even during a
+    // block — otherwise an induced block (all tunnel traffic shares the single
+    // "unknown" bucket since bore sets no x-forwarded-for, so 5 wrong codes is
+    // enough) would lock the legitimate owner out of their own dashboard.
+    if (isValid) {
+      failedLogins.delete(ip);
+      return next();
     }
 
-    // Success - reset attempts
-    failedLogins.delete(ip);
-    return next();
+    // Invalid code: now enforce existing blocks, then record this failure.
+    if (globalBlockTime > now) {
+      const remainingSecs = Math.ceil((globalBlockTime - now) / 1000);
+      return c.text(`Too many failed attempts globally. Blocked for another ${remainingSecs} seconds.`, 429);
+    }
+    const record = failedLogins.get(ip);
+    if (record && record.blockedUntil > now) {
+      const remainingSecs = Math.ceil((record.blockedUntil - now) / 1000);
+      return c.text(`Too many failed attempts. Blocked for another ${remainingSecs} seconds.`, 429);
+    }
+
+    // 1. Record IP failure. `ip` comes from the client-supplied x-forwarded-for
+    // (bore delivers "unknown"); a spoofed rotating XFF would otherwise grow this
+    // Map without bound. Evict expired entries, and hard-cap as a backstop.
+    if (failedLogins.size > 1000) {
+      for (const [k, v] of failedLogins) {
+        if (v.blockedUntil <= now && v.count === 0) failedLogins.delete(k);
+      }
+      let over = failedLogins.size - 1000;
+      for (const k of failedLogins.keys()) {
+        if (over-- <= 0) break;
+        failedLogins.delete(k);
+      }
+    }
+    const current = failedLogins.get(ip) ?? { count: 0, blockedUntil: 0 };
+    current.count += 1;
+    if (current.count >= 5) {
+      current.blockedUntil = now + 15 * 60 * 1000; // 15 mins block
+      current.count = 0;
+    }
+    failedLogins.set(ip, current);
+
+    // 2. Record Global failure
+    if (globalResetTime < now) {
+      globalFailCount = 0;
+      globalResetTime = now + 5 * 60 * 1000; // 5 mins reset window
+    }
+    globalFailCount += 1;
+    if (globalFailCount >= 15) {
+      globalBlockTime = now + 15 * 60 * 1000; // 15 mins global block
+      globalFailCount = 0;
+    }
+
+    return c.text("Unauthorized", 401);
   };
 
   /** GET /api/dashboard/stats — returns data for the web UI */
@@ -1224,7 +1244,15 @@ export function createApiApp(
   });
 
   /** GET /api/dashboard/error-logs — list recent API error logs (any status) */
+  // Cached: the dashboard polls this every ~3s and the handler does a
+  // readdir + statSync-per-file (up to ~300) synchronously on the same event
+  // loop that proxies all Claude traffic. Unlike /usage this had no cache — an
+  // 8s cache cuts the scan to a trickle without noticeably staling the list.
+  let errorLogsCache: { at: number; payload: unknown } | null = null;
   app.get("/api/dashboard/error-logs", dashboardAuth, (c) => {
+    if (errorLogsCache && Date.now() - errorLogsCache.at < 8_000) {
+      return c.json(errorLogsCache.payload as object);
+    }
     const logDir = path.join(os.homedir(), ".claude-share", "logs");
     try {
       if (!fs.existsSync(logDir)) return c.json({ logs: [] });
@@ -1239,7 +1267,9 @@ export function createApiApp(
           };
         })
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      return c.json({ logs: files });
+      const payload = { logs: files };
+      errorLogsCache = { at: Date.now(), payload };
+      return c.json(payload);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
@@ -1277,9 +1307,18 @@ export function createApiApp(
   });
 
   /** GET /api/dashboard/usage — token volume per model seen through the proxy */
+  // Cache the aggregate: readUsageEvents() does a synchronous read of the whole
+  // ledger, and the dashboard polls this on a timer — recomputing every call
+  // blocks the event loop on a long-running share. 60s freshness is plenty.
+  let usageAggCache: { at: number; payload: unknown } | null = null;
   app.get("/api/dashboard/usage", dashboardAuth, (c) => {
+    if (usageAggCache && Date.now() - usageAggCache.at < 60_000) {
+      return c.json(usageAggCache.payload as object);
+    }
     const events = readUsageEvents();
-    return c.json({ byModel: byModel(events), totalEvents: events.length });
+    const payload = { byModel: byModel(events), totalEvents: events.length };
+    usageAggCache = { at: Date.now(), payload };
+    return c.json(payload);
   });
 
   /**
@@ -1357,6 +1396,13 @@ export function createApiApp(
     const { file } = await c.req.json<{ file?: string }>();
     const flow = readFlow(file ?? "");
     if (!flow) return c.text("Not found", 404);
+    // Defense-in-depth: flow.path is receiver-influenced. It's only recorded for
+    // allow-listed api.anthropic.com paths (all "/"-prefixed) so host-confusion
+    // SSRF (…api.anthropic.com@evil.com) is unreachable today — but validate here
+    // too so loosening the recorder later can't reintroduce token-exfil.
+    if (!/^\/[^/]/.test(flow.path)) {
+      return c.text("Invalid recorded path", 400);
+    }
     try {
       const headers: Record<string, string> = {
         authorization: `Bearer ${await getFreshAccessToken()}`,
