@@ -40,6 +40,7 @@ function redactEmails(obj: any): any {
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const CTX_REQUEST_BODY = Symbol("requestBody");
+const CTX_REQUEST_BODY_READY = Symbol("requestBodyReady");
 const CTX_RETRIED = Symbol("retried");
 const socketMachineId = new WeakMap<object, string>();
 
@@ -155,10 +156,18 @@ export async function createMitmProxy(
       // surfacing the library's default 504 — same recovery Claude Code's own
       // CLI uses for this exact ECONNRESET/EPIPE race (disableKeepAlive + fresh
       // client + retry in its withRetry.ts).
+      // A POST body we never buffered (e.g. platform.claude.com OAuth calls,
+      // which don't go through the redaction filter below) can't be replayed
+      // safely — fall through to the library's default 504 for those instead
+      // of retrying with a truncated/empty body.
+      const method = ctx?.clientToProxyRequest?.method;
+      const bodyReplayable = method !== "POST" || ctx?.[CTX_REQUEST_BODY_READY] !== undefined;
+
       if (
         kind === "PROXY_TO_SERVER_REQUEST_ERROR" &&
         code === "ECONNRESET" &&
         clientAwaitingResponse &&
+        bodyReplayable &&
         !ctx[CTX_RETRIED]
       ) {
         ctx[CTX_RETRIED] = true;
@@ -173,26 +182,37 @@ export async function createMitmProxy(
     function retryOnFreshConnection(ctx: any) {
       const options = { ...ctx.proxyToServerRequestOptions, agent: false as const };
       const transport = ctx.isSSL ? https : http;
-      const retryReq = transport.request(options, (retryRes: any) => {
-        const clientRes = ctx.proxyToClientResponse;
-        if (!clientRes || clientRes.headersSent) return;
-        const headers = { ...retryRes.headers };
-        delete headers["authorization"];
-        delete headers["set-cookie"];
-        delete headers["x-api-key"];
-        delete headers["anthropic-organization-id"];
-        clientRes.writeHead(retryRes.statusCode ?? 502, headers);
-        retryRes.pipe(clientRes);
-      });
-      retryReq.on("error", (retryErr: Error) => {
-        logger.error("[mitm] retry on fresh connection failed", retryErr);
-        _origOnError("PROXY_TO_SERVER_REQUEST_ERROR", ctx, retryErr);
-      });
-      const body = ctx[CTX_REQUEST_BODY];
-      if (typeof body === "string") {
-        retryReq.end(Buffer.from(body));
+
+      const send = (body?: string) => {
+        const retryReq = transport.request(options, (retryRes: any) => {
+          const clientRes = ctx.proxyToClientResponse;
+          if (!clientRes || clientRes.headersSent) return;
+          const headers = { ...retryRes.headers };
+          delete headers["authorization"];
+          delete headers["set-cookie"];
+          delete headers["x-api-key"];
+          delete headers["anthropic-organization-id"];
+          clientRes.writeHead(retryRes.statusCode ?? 502, headers);
+          retryRes.pipe(clientRes);
+        });
+        retryReq.on("error", (retryErr: Error) => {
+          logger.error("[mitm] retry on fresh connection failed", retryErr);
+          _origOnError("PROXY_TO_SERVER_REQUEST_ERROR", ctx, retryErr);
+        });
+        if (typeof body === "string") {
+          retryReq.end(Buffer.from(body));
+        } else {
+          retryReq.end();
+        }
+      };
+
+      // Wait for the full (redacted) body to be buffered before replaying —
+      // the stale-socket error can race ahead of the client finishing its upload.
+      const bodyReady: Promise<string> | undefined = ctx[CTX_REQUEST_BODY_READY];
+      if (bodyReady) {
+        bodyReady.then(send).catch(() => send());
       } else {
-        retryReq.end();
+        send();
       }
     }
 
@@ -294,6 +314,15 @@ export async function createMitmProxy(
             delete ctx.proxyToServerRequestOptions.headers["content-length"];
             ctx.proxyToServerRequestOptions.headers["transfer-encoding"] = "chunked";
             const chunks: Buffer[] = [];
+            // Retry (see retryOnFreshConnection) must not resend before the
+            // client has finished uploading its body — a stale-socket ECONNRESET
+            // can fire before flush() below runs, and reading ctx[CTX_REQUEST_BODY]
+            // synchronously at that point would replay an empty body and Anthropic
+            // rejects it with "Input is a zero-length, empty document".
+            let resolveBodyReady!: (body: string) => void;
+            ctx[CTX_REQUEST_BODY_READY] = new Promise<string>((resolve) => {
+              resolveBodyReady = resolve;
+            });
             ctx.addRequestFilter(
               new Transform({
                 transform(chunk, _enc, done) {
@@ -312,6 +341,7 @@ export async function createMitmProxy(
                     redacted = body.replace(EMAIL_RE, "[REDACTED]");
                   }
                   ctx[CTX_REQUEST_BODY] = redacted;
+                  resolveBodyReady(redacted);
                   this.push(Buffer.from(redacted));
                   done();
                 },
