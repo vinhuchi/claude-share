@@ -20,6 +20,51 @@ import { resolveMachineId } from "../session/manager";
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
+// A complete JSON string literal: opening quote, body of ordinary chars or
+// backslash-escapes, closing quote. `[^"\\]` and `\\.` never overlap on their
+// first char, so this is linear — no catastrophic backtracking on hostile input.
+const JSON_STRING_RE = /"(?:[^"\\]|\\.)*"/g;
+
+// Redact emails from a JSON request body without ever emitting invalid JSON and
+// without disturbing anything that isn't an email. Two earlier approaches each
+// broke a different half of that:
+//   • JSON.parse(body) → walk → JSON.stringify re-encodes escapes correctly but
+//     silently truncates integer literals > 2^53 (64-bit IDs, bigints a receiver
+//     may send) — Anthropic then gets a different number than was sent.
+//   • body.replace(EMAIL_RE, …) on the raw text keeps numbers intact but the
+//     regex can start inside a JSON escape (the "n" of "\n"), swallow the escape
+//     letter, and leave a bare "\" before "[REDACTED]" → "invalid escaped
+//     character in string" 400s from Anthropic.
+// This rewrites only string *tokens*: decode each with JSON.parse (so escapes are
+// real characters the email regex can't straddle), redact on the decoded value,
+// then JSON.stringify to re-encode (always valid escapes). Numbers and structure
+// are never parsed, so bigints round-trip byte-exact; emails only ever live
+// inside strings, so coverage stays complete. Only tokens that actually contain
+// a redacted email are rewritten — everything else is returned byte-for-byte.
+function redactEmailsInJson(body: string): string {
+  if (!body.includes("@")) return body;
+  try {
+    return body.replace(JSON_STRING_RE, (token) => {
+      if (!token.includes("@")) return token;
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(token);
+      } catch {
+        return token; // not a decodable string token — leave it exactly as-is
+      }
+      if (typeof decoded !== "string") return token;
+      const red = decoded.replace(EMAIL_RE, "[REDACTED]");
+      return red === decoded ? token : JSON.stringify(red);
+    });
+  } catch (err) {
+    // Redaction is a privacy nicety, never a reason to drop or corrupt a
+    // request. If anything unexpected throws, forward the body byte-for-byte
+    // exactly as the receiver sent it so the forward always succeeds.
+    logger.warn("[mitm] email redaction failed, forwarding body unmodified", err);
+    return body;
+  }
+}
+
 const CTX_LOG_ID = Symbol("logId");
 const CTX_MACHINE_ID = Symbol("machineId");
 const CTX_REQUEST_BODY = Symbol("requestBody");
@@ -448,15 +493,10 @@ export async function createMitmProxy(
                 },
                 flush(done) {
                   const body = Buffer.concat(chunks).toString("utf8");
-                  // Redact on the raw string — do NOT JSON.parse/stringify. That
-                  // round-trip silently corrupts integer literals > 2^53 (64-bit
-                  // IDs, DB bigints) a receiver may include in a message, so
-                  // Anthropic would receive a different number than was sent. The
-                  // regex only rewrites email-looking substrings; includes("@")
-                  // skips the scan entirely for the common case.
-                  const redacted = body.includes("@")
-                    ? body.replace(EMAIL_RE, "[REDACTED]")
-                    : body;
+                  // Redact emails token-by-token: bigints round-trip byte-exact
+                  // (never parsed) and the re-encoding can never emit an invalid
+                  // JSON escape. See redactEmailsInJson for the full rationale.
+                  const redacted = redactEmailsInJson(body);
                   ctx[CTX_REQUEST_BODY] = redacted;
                   resolveBodyReady(redacted);
                   this.push(Buffer.from(redacted));
