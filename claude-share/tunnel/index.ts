@@ -219,7 +219,7 @@ export async function startTunnel(
   const boreBin = (await getBorePath()) ?? "bore";
   const savedPort = process.env.BORE_FIXED_PORT
     ? parseInt(process.env.BORE_FIXED_PORT, 10)
-    : loadSavedBorePort();
+    : (loadSavedBorePort() ?? 39863);
   const args = ["local", String(localPort), "--to", BORE_SERVER];
   if (BORE_PASSWORD) args.push("--secret", BORE_PASSWORD);
   if (savedPort) args.push("--port", String(savedPort));
@@ -241,9 +241,20 @@ export async function startTunnel(
       const text = chunk.toString();
       const match = text.match(/listening at \S+:(\d+)/i);
       if (match && !settled) {
+        const port = parseInt(match[1], 10);
+        if (savedPort && port !== savedPort) {
+          settled = true;
+          clearTimeout(timeout);
+          proc.kill();
+          reject(
+            new Error(
+              `Server assigned port ${port} instead of requested ${savedPort}`,
+            ),
+          );
+          return;
+        }
         settled = true;
         clearTimeout(timeout);
-        const port = parseInt(match[1], 10);
         saveBorePort(port);
         resolve({
           publicUrl: `https://${BORE_SERVER}:${port}`,

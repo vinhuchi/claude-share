@@ -832,6 +832,7 @@ export function createApiApp(
                 }
             } catch (err) {
                 console.error(err);
+                throw err;
             }
         }
 

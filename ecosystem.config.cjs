@@ -22,6 +22,7 @@ module.exports = {
       cron_restart: "0 4 * * *", // nightly recycle (04:00) — cheap safety net
       env: {
         NODE_ENV: "production",
+        BORE_FIXED_PORT: "39863",
       },
     },
   ],
