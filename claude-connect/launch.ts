@@ -399,6 +399,38 @@ export async function launchClaude(
       }, 30_000)
     : null;
 
+  // Network monitor: Claude makes its own API calls through HTTPS_PROXY, so
+  // claude-connect can't see or log those requests. When Claude prints
+  // "API error / check your network / Retrying", probe the tunnel here so
+  // connect.log shows WHICH leg is broken:
+  //   unreachable → CLIENT-side (this machine's network/VPN, or bore/the share
+  //                 is offline) — that's what Claude's "check your network" means.
+  //   reachable   → the tunnel is fine, so the failure is SERVER-side
+  //                 (sharer ↔ Anthropic). Look at the sharer dashboard "Errors"
+  //                 tab / logs at the same timestamp for the real status/reason.
+  let netReachable: boolean | null = null;
+  const netMonitor = setInterval(() => {
+    void apiFetch(`${proxyUrl}/health`, { timeout: 6000, ca: caPem })
+      .then(() => {
+        if (netReachable !== true) {
+          netReachable = true;
+          logger.info(
+            "[net] tunnel to sharer reachable (proxy /health OK) — any Claude API errors right now are SERVER-side; check the sharer dashboard Errors tab",
+          );
+        }
+      })
+      .catch((err) => {
+        if (netReachable !== false) {
+          netReachable = false;
+          logger.warn(
+            `[net] CANNOT reach sharer through tunnel (leg receiver→bore→sharer DOWN): ${(err as Error)?.message ?? err} — ` +
+              `Claude's "check your network"/Retrying errors are a CLIENT-side tunnel problem (this machine's network/VPN, or bore/the share is offline), not the sharer's account`,
+          );
+        }
+      });
+  }, 15_000);
+  netMonitor.unref?.();
+
   p.log.success("\x1b[32mLaunching Claude...\x1b[0m");
 
   p.outro("");
@@ -429,6 +461,16 @@ export async function launchClaude(
       HTTPS_PROXY: httpProxyUrl,
       HTTP_PROXY: httpProxyUrl,
       NODE_EXTRA_CA_CERTS: tmpCert,
+      // Claude's child processes (MCP servers, and the tools THEY spawn — uv,
+      // pip, curl, git…) inherit HTTPS_PROXY and so tunnel through the MITM
+      // proxy, but non-Node tools don't read NODE_EXTRA_CA_CERTS, so they reject
+      // the proxy's self-signed cert ("invalid peer certificate / tunnel error /
+      // can't auth"). Point their CA-bundle env vars at the same bundle (MITM CA
+      // + real roots) so they trust the proxy AND still validate real sites.
+      SSL_CERT_FILE: tmpCert,
+      REQUESTS_CA_BUNDLE: tmpCert,
+      CURL_CA_BUNDLE: tmpCert,
+      GIT_SSL_CAINFO: tmpCert,
     },
   });
 
@@ -448,6 +490,7 @@ export async function launchClaude(
     // mouse move.
     resetTerminalModes();
     if (heartbeat) clearInterval(heartbeat);
+    clearInterval(netMonitor);
     if (sessionId) {
       await sessionPost(
         proxyUrl,
@@ -498,6 +541,7 @@ export async function launchClaude(
       "Is 'claude' installed? Run: npm install -g @anthropic-ai/claude-code",
     );
     if (heartbeat) clearInterval(heartbeat);
+    clearInterval(netMonitor);
     if (sessionId) {
       void sessionPost(
         proxyUrl,
