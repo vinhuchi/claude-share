@@ -595,12 +595,33 @@ async function main() {
     cleanup();
   });
 
+  // Opt-in Cloudflare Tunnel connect URL (independent second public path). The
+  // Cloudflare tunnel is a `tcp://` ingress, so the receiver must bridge with
+  // `cloudflared access tcp` — signal that with ?cf=1 and carry the (optional)
+  // Access service token in the URL so the receiver can bridge BEFORE pairing
+  // (it can't reach /pair over the tunnel otherwise). The URL is already a full
+  // secret (it contains the pairing code), so the token rides safely with it.
+  const cfHostname = process.env.CLOUDFLARE_TUNNEL_HOSTNAME?.trim();
+  const cloudflareConnectUrl = cfHostname
+    ? (() => {
+        const q = new URLSearchParams({ cf: "1" });
+        const id = process.env.CLOUDFLARE_ACCESS_CLIENT_ID?.trim();
+        const sec = process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET?.trim();
+        if (id && sec) {
+          q.set("cfid", id);
+          q.set("cfsec", sec);
+        }
+        return `claudeshare://${cfHostname}/connect/${session.pairingCode}?${q.toString()}`;
+      })()
+    : null;
+
   if (isHeadless) {
     // ── Headless mode: no Ink TUI, log events to stdout ─────────────────────
     const connectUrl = (base: string) =>
       `claudeshare://${base.replace(/^https?:\/\//, "")}/connect/${session.pairingCode}`;
 
     if (publicUrl) process.stdout.write(`[claude-share] Public:  ${connectUrl(publicUrl)}\n`);
+    if (cloudflareConnectUrl) process.stdout.write(`[claude-share] Public (Cloudflare): ${cloudflareConnectUrl}\n`);
     if (lanUrl)    process.stdout.write(`[claude-share] LAN:     ${connectUrl(lanUrl)}\n`);
     process.stdout.write(`[claude-share] Local:   ${connectUrl(loopbackUrl)}\n`);
 

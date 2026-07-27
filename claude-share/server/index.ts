@@ -17,15 +17,24 @@ import {
   heartbeatMachineSession,
   regeneratePairingCode,
   removeMachine,
+  resolveMachineId,
+  setMachineAccount,
+  setMachineTransport,
+  setMachineSpeedtest,
   setSessionUnlimited,
   type ConnectionFile,
   type SharerAccount,
 } from "../session/manager";
 
 import { getTotalStats, getMachineStats } from "../proxy/tokenCounter";
+import { getMachineBytes, getTotalBytes } from "../proxy/bytesCounter";
 import { getEntries } from "../proxy/requestLog";
 import { readUsageEvents, byModel } from "../proxy/usageLog";
-import { getFreshAccessToken } from "../proxy/token";
+import {
+  getFreshAccessToken,
+  hasAccount,
+  listAccounts,
+} from "../proxy/token";
 import {
   isRecording,
   setRecording,
@@ -138,6 +147,17 @@ export function createApiApp(
     const machine = addMachine(session, name);
     saveSession(session);
 
+    // Cloudflare Tunnel is an opt-in second public path (set on the sharer via
+    // env). It rides in the encrypted blob so the receiver can bridge to it.
+    const cfHostname = process.env.CLOUDFLARE_TUNNEL_HOSTNAME?.trim();
+    const cloudflare = cfHostname
+      ? {
+          hostname: cfHostname,
+          serviceTokenId: process.env.CLOUDFLARE_ACCESS_CLIENT_ID?.trim() || undefined,
+          serviceTokenSecret: process.env.CLOUDFLARE_ACCESS_CLIENT_SECRET?.trim() || undefined,
+        }
+      : null;
+
     const file: ConnectionFile = {
       publicServerUrl: urls.public,
       sessionId: session.id,
@@ -147,9 +167,19 @@ export function createApiApp(
       systemName,
       proxyUser: machine.id,
       proxyPass: machine.proxyPass,
+      cloudflare,
     };
 
     const blob = encryptConnectionFile(session, file);
+
+    // Auto-rotate the pairing code after every successful pair. The code is
+    // single-use, so mint a fresh one immediately: the dashboard then always
+    // shows a usable code and the next device can pair without a manual
+    // Regenerate. `blob` above was encrypted with the OLD key, so this receiver
+    // (holding the old code) still decrypts fine.
+    regeneratePairingCode(session);
+    saveSession(session);
+
     return c.json({ blob, machineId: machine.id });
   });
 
@@ -157,10 +187,53 @@ export function createApiApp(
   app.post("/session/start", async (c) => {
     const session = getSession();
     if (!session) return c.json({ error: "No active session" }, 503);
-    const { machineId } = await c.req.json<{ machineId: string }>();
+    const { machineId, transport } = await c.req.json<{
+      machineId: string;
+      transport?: string;
+    }>();
     const ms = addMachineSession(session, machineId);
     if (!ms) return c.json({ error: "Machine not found" }, 404);
+    if (transport) setMachineTransport(session, machineId, transport);
     return c.json({ ok: true, sessionId: ms.id });
+  });
+
+  /**
+   * GET /speedtest?bytes=N — returns N bytes of filler so the receiver can
+   * benchmark download throughput over each transport (bore vs Cloudflare) and
+   * report the result. Proxy-authed by the global middleware; size is capped so
+   * it can't be used to burn bandwidth.
+   */
+  app.get("/speedtest", (c) => {
+    const requested = parseInt(c.req.query("bytes") ?? "3000000", 10) || 0;
+    const n = Math.min(Math.max(requested, 0), 25_000_000);
+    return c.body(Buffer.alloc(n), 200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(n),
+      "Cache-Control": "no-store",
+    });
+  });
+
+  /**
+   * POST /session/speedtest {boreMbps, cloudflareMbps} — the receiver reports the
+   * download throughput it measured over each transport. Proxy-authed; a machine
+   * is resolved from its own auth so it can only report for itself.
+   */
+  app.post("/session/speedtest", async (c) => {
+    const session = getSession();
+    if (!session) return c.json({ error: "No active session" }, 503);
+    const auth = c.req.header("proxy-authorization") ?? "";
+    const mid = resolveMachineId(session, auth);
+    if (!mid) return c.json({ error: "Machine not found" }, 404);
+    const body = await c.req.json<{ boreMbps?: unknown; cloudflareMbps?: unknown }>();
+    const num = (v: unknown): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    setMachineSpeedtest(session, mid, {
+      boreMbps: num(body.boreMbps),
+      cloudflareMbps: num(body.cloudflareMbps),
+    });
+    return c.json({ ok: true });
   });
 
   /** POST /session/end — receiver closed a Claude session */
@@ -203,6 +276,96 @@ export function createApiApp(
       })),
     }));
     return c.json({ machines, sharedUntil: session.sharedUntil.toISOString() });
+  });
+
+  // ── Multi-account: receiver picks which sharer account to use ──────────────
+
+  // /api/oauth/usage is rate-limited (429), so cache each account's utilization
+  // for 5 minutes. Shared by the account picker so a receiver listing accounts
+  // doesn't hammer Anthropic once per account per refresh.
+  const acctUsageCache = new Map<
+    string,
+    { at: number; usage: Array<{ key: string; pct: number; resetsAt: string | null }> | null }
+  >();
+  const ACCT_USAGE_TTL = 5 * 60 * 1000;
+
+  function summarizeUsage(
+    usage: Record<string, any>,
+  ): Array<{ key: string; pct: number; resetsAt: string | null }> {
+    return Object.entries(usage || {})
+      .filter(
+        ([, v]) => v && typeof v === "object" && ("utilization" in v || "percent" in v),
+      )
+      .map(([key, v]) => {
+        const rawVal = (v.utilization ?? v.percent) || 0;
+        const pct = rawVal <= 1 ? Math.round(rawVal * 100) : Math.round(rawVal);
+        return { key, pct, resetsAt: v.resets_at ?? null };
+      });
+  }
+
+  async function accountUsage(accountId: string) {
+    const cached = acctUsageCache.get(accountId);
+    if (cached && Date.now() - cached.at < ACCT_USAGE_TTL) return cached.usage;
+    try {
+      const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: {
+          authorization: `Bearer ${await getFreshAccessToken(accountId)}`,
+          "anthropic-beta": "oauth-2025-04-20",
+          "anthropic-version": "2023-06-01",
+        },
+      });
+      if (!res.ok) {
+        if (cached) return cached.usage; // serve last good on 429/5xx
+        return null;
+      }
+      const usage = summarizeUsage((await res.json()) as Record<string, any>);
+      acctUsageCache.set(accountId, { at: Date.now(), usage });
+      return usage;
+    } catch {
+      return cached?.usage ?? null;
+    }
+  }
+
+  /**
+   * GET /accounts — the sharer accounts a receiver may pick from, with each
+   * account's email, plan and live /usage utilization. Proxy-authed (only paired
+   * machines can list accounts). Fixed at launch: the receiver POSTs its choice
+   * to /session/select-account before starting Claude.
+   */
+  app.get("/accounts", async (c) => {
+    const metas = listAccounts();
+    const accounts = await Promise.all(
+      metas.map(async (m) => ({
+        id: m.id,
+        email: m.email,
+        plan: m.plan,
+        usage: await accountUsage(m.id),
+      })),
+    );
+    const session = getSession();
+    const auth = c.req.header("proxy-authorization") ?? "";
+    const mid = session ? resolveMachineId(session, auth) : null;
+    const selected = mid ? session!.machines.get(mid)?.selectedAccount ?? null : null;
+    return c.json({ accounts, selected });
+  });
+
+  /**
+   * POST /session/select-account {accountId} — pin this machine's requests to a
+   * sharer account for the whole session. The machine is resolved from its own
+   * proxy-auth (a machine can only set its own selection).
+   */
+  app.post("/session/select-account", async (c) => {
+    const session = getSession();
+    if (!session) return c.json({ error: "No active session" }, 503);
+    const auth = c.req.header("proxy-authorization") ?? "";
+    const mid = resolveMachineId(session, auth);
+    if (!mid) return c.json({ error: "Machine not found" }, 404);
+    const { accountId } = await c.req.json<{ accountId?: string | null }>();
+    if (accountId != null && !hasAccount(accountId)) {
+      return c.json({ error: "Unknown account" }, 400);
+    }
+    setMachineAccount(session, mid, accountId ?? null);
+    return c.json({ ok: true });
   });
 
   // ── Web Dashboard Routes ──────────────────────────────────────────────────
@@ -329,6 +492,13 @@ export function createApiApp(
                                 </div>
                             </div>
                         </div>
+                        <div id="cf-link-row" style="display:none">
+                            <span class="text-xs text-zinc-500 block mb-1">Cloudflare Connect URL (share.rocl.one):</span>
+                            <div class="flex gap-2">
+                                <input type="text" id="cf-link-text" readOnly class="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-xs font-mono text-orange-400 select-all" />
+                                <button onclick="copyVal('cf-link-text')" class="px-3 py-2 bg-zinc-800 text-xs font-semibold hover:bg-zinc-700 text-orange-400 rounded-lg transition">Copy</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -421,6 +591,8 @@ export function createApiApp(
                                 <th class="py-3 px-4">ID</th>
                                 <th class="py-3 px-4">Usage (Tokens)</th>
                                 <th class="py-3 px-4">Estimated Spend</th>
+                                <th class="py-3 px-4">Traffic (&uarr; / &darr; &middot; live)</th>
+                                <th class="py-3 px-4">Transport &middot; bore/cf</th>
                                 <th class="py-3 px-4 text-right">Actions</th>
                             </tr>
                         </thead>
@@ -620,6 +792,29 @@ export function createApiApp(
             return n;
         }
 
+        function fmtBytes(n) {
+            n = n || 0;
+            if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+            if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
+            if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+            return n + ' B';
+        }
+
+        function fmtRate(bytesPerSec) {
+            if (!bytesPerSec || bytesPerSec < 1) return '0 KB/s';
+            return fmtBytes(bytesPerSec) + '/s';
+        }
+
+        function fmtMbps(v) {
+            return (v === null || v === undefined) ? '—' : v.toFixed(1) + ' Mbps';
+        }
+
+        function transportBadge(t) {
+            if (t === 'cloudflare') return '<span class="px-2 py-0.5 text-xs font-semibold rounded bg-orange-950/30 text-orange-400">cloudflare</span>';
+            if (t === 'bore') return '<span class="px-2 py-0.5 text-xs font-semibold rounded bg-sky-950/30 text-sky-400">bore</span>';
+            return '<span class="text-zinc-600 text-xs">—</span>';
+        }
+
         function formatExpiry(expiryStr) {
             const ms = new Date(expiryStr).getTime() - Date.now();
             if (ms <= 0) return 'Expired';
@@ -753,6 +948,17 @@ export function createApiApp(
                 el('pairing-link-text').value = connectUrl;
                 el('pairing-code-text').value = data.pairingCode;
                 el('connect-cmd-text').value = 'claude-connect --share "' + connectUrl + '"';
+
+                // Render Cloudflare (share.rocl.one) link when a tunnel hostname is configured
+                const cfRow = el('cf-link-row');
+                if (cfRow) {
+                    if (data.cloudflareHost) {
+                        el('cf-link-text').value = 'claudeshare://' + data.cloudflareHost + '/connect/' + data.pairingCode + '?cf=1';
+                        cfRow.style.display = '';
+                    } else {
+                        cfRow.style.display = 'none';
+                    }
+                }
                 
                 // Render token stats
                 const ts = data.totalStats;
@@ -783,7 +989,7 @@ export function createApiApp(
                 const mBody = el('machines-tbody');
                 mBody.innerHTML = '';
                 if (data.machines.length === 0) {
-                    mBody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-zinc-500">No connected devices yet.</td></tr>';
+                    mBody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-zinc-500">No connected devices yet.</td></tr>';
                 } else {
                     data.machines.forEach(m => {
                         window.machinesMap[m.id] = m.name;
@@ -796,7 +1002,22 @@ export function createApiApp(
 
                         const active = m.sessions.some(s => s.active);
                         const cost = calcCost(m.stats.inputTokens, m.stats.outputTokens, m.stats.cacheReadTokens, m.stats.cacheWriteTokens);
-                        
+
+                        // Live up/down speed = delta of cumulative bytes since the
+                        // previous poll (~3s), divided by the elapsed time.
+                        const now = Date.now();
+                        window.prevBytes = window.prevBytes || {};
+                        const pb = window.prevBytes[m.id];
+                        let upSpd = 0, downSpd = 0;
+                        if (pb) {
+                            const dt = (now - pb.t) / 1000;
+                            if (dt > 0) {
+                                upSpd = Math.max(0, ((m.bytesUp || 0) - pb.up) / dt);
+                                downSpd = Math.max(0, ((m.bytesDown || 0) - pb.down) / dt);
+                            }
+                        }
+                        window.prevBytes[m.id] = { up: m.bytesUp || 0, down: m.bytesDown || 0, t: now };
+
                         const tr = document.createElement('tr');
                         tr.className = 'border-b border-zinc-800 hover:bg-zinc-900/30 transition';
                         const statusColor = active ? 'bg-green-500 animate-pulse' : 'bg-yellow-500';
@@ -812,6 +1033,14 @@ export function createApiApp(
                             '<td class="py-3 px-4 text-sm">' +
                             '<span class="font-semibold">$' + cost + '</span><br/>' +
                             '<span class="text-zinc-500 text-xs">' + m.stats.requests + ' req</span>' +
+                            '</td>' +
+                            '<td class="py-3 px-4 text-sm whitespace-nowrap">' +
+                            '<span class="text-cyan-400">&uarr; ' + fmtBytes(m.bytesUp || 0) + '</span> · <span class="text-emerald-400">&darr; ' + fmtBytes(m.bytesDown || 0) + '</span><br/>' +
+                            '<span class="text-zinc-500 text-xs">' + fmtRate(upSpd) + ' &uarr; · ' + fmtRate(downSpd) + ' &darr;</span>' +
+                            '</td>' +
+                            '<td class="py-3 px-4 text-sm whitespace-nowrap">' +
+                            transportBadge(m.transport) +
+                            (m.speedtest ? '<br/><span class="text-zinc-500 text-xs">bore ' + fmtMbps(m.speedtest.boreMbps) + ' · cf ' + fmtMbps(m.speedtest.cloudflareMbps) + '</span>' : '') +
                             '</td>' +
                             '<td class="py-3 px-4 text-right">' +
                             '<button onclick="revokeMachine(' + "'" + m.id + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>' +
@@ -1206,11 +1435,16 @@ export function createApiApp(
 
     const machines = [...session.machines.values()].map((m) => {
       const stats = getMachineStats(m.id);
+      const bytes = getMachineBytes(m.id);
       return {
         id: m.id,
         name: m.name,
         pairedAt: m.pairedAt.toISOString(),
         stats,
+        bytesUp: bytes.up,
+        bytesDown: bytes.down,
+        transport: m.transport ?? null,
+        speedtest: m.speedtest ?? null,
         sessions: [...m.sessions.values()].map((s) => ({
           id: s.id,
           startedAt: s.startedAt.toISOString(),
@@ -1226,10 +1460,12 @@ export function createApiApp(
       systemName,
       publicUrl: urls.public,
       lanUrl: urls.lan,
+      cloudflareHost: process.env.CLOUDFLARE_TUNNEL_HOSTNAME?.trim() || null,
       localPort,
       pairingCode: session.pairingCode,
       sharedUntil: session.sharedUntil.toISOString(),
       totalStats,
+      totalBytes: getTotalBytes(),
       machines,
     });
   });

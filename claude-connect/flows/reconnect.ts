@@ -61,5 +61,7 @@ export async function reconnectFlow(
     claudeArgs,
     chosen.sharerAccount ?? null,
     cwd,
+    "bore",
+    { bore: resolvedUrl },
   );
 }

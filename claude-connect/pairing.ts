@@ -1,7 +1,7 @@
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 
 import { fromBase58 } from "@shared/base58";
-import type { ConnectionFile } from "./types";
+import type { CloudflareTunnelInfo, ConnectionFile } from "./types";
 
 export function decryptBlob(blob: string, pairingCode: string): ConnectionFile {
   // Pairing code is the full 32-byte session key encoded in base58
@@ -23,7 +23,11 @@ export function decryptBlob(blob: string, pairingCode: string): ConnectionFile {
 // The server does not need to handle this path — it's parsed client-side only.
 export function parseConnectUrl(
   url: string,
-): { serverUrl: string; pairingCode: string } | null {
+): {
+  serverUrl: string;
+  pairingCode: string;
+  cloudflare?: CloudflareTunnelInfo;
+} | null {
   if (!/^(claudeshare|https):\/\//.test(url)) return null;
   const normalised = url.replace(/^claudeshare:\/\//, "https://");
   // Tolerate an optional trailing slash and ignore any query string / hash.
@@ -31,5 +35,21 @@ export function parseConnectUrl(
     /^(https:\/\/.+?)\/connect\/([A-Za-z0-9]+)\/?(?:[?#].*)?$/,
   );
   if (!match) return null;
-  return { serverUrl: match[1], pairingCode: match[2] };
+
+  // A Cloudflare-tunnel URL carries ?cf=1 (and, if the tunnel is behind an
+  // Access app, the service token) so the receiver can bridge with
+  // `cloudflared access tcp` before it can even reach /pair.
+  let cloudflare: CloudflareTunnelInfo | undefined;
+  try {
+    const u = new URL(normalised);
+    if (u.searchParams.get("cf") === "1") {
+      cloudflare = {
+        hostname: u.hostname,
+        serviceTokenId: u.searchParams.get("cfid") ?? undefined,
+        serviceTokenSecret: u.searchParams.get("cfsec") ?? undefined,
+      };
+    }
+  } catch {}
+
+  return { serverUrl: match[1], pairingCode: match[2], cloudflare };
 }

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
+import https from "node:https";
 import { promisify } from "node:util";
 
 import * as p from "@clack/prompts";
@@ -37,7 +38,10 @@ function collectEnvFiles(dir: string, depth = 0, results: string[] = []): string
   return results;
 }
 
-export function ensureConnectSettings(cwd?: string): string {
+export function ensureConnectSettings(
+  cwd?: string,
+  env?: Record<string, string>,
+): string {
   const connectDir = path.join(os.homedir(), ".claude-connect");
   const settingsPath = path.join(connectDir, "settings.json");
 
@@ -62,6 +66,21 @@ export function ensureConnectSettings(cwd?: string): string {
   }
 
   settings["permissions"] = { ...perms, deny: [...deny] };
+
+  // Claude Code v2 runs a persistent daemon that spawns resumed/forked
+  // conversations and background agents as SEPARATE `claude` processes — each
+  // launched with `--settings <this file>` (verified in the process table). They
+  // inherit the launcher's process env, but that env can go stale (e.g. a temp
+  // CA path deleted on another launch's exit) and the daemon outlives the
+  // launcher, so process-env inheritance alone isn't reliable across resumes.
+  // Claude Code applies a settings `env` block to every session it starts, so
+  // pinning the proxy + STABLE CA bundle here makes those agents pick up the
+  // right values regardless of what env the daemon happened to inherit.
+  if (env) {
+    const existing = (settings["env"] as Record<string, string>) ?? {};
+    settings["env"] = { ...existing, ...env };
+  }
+
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
 
   return settingsPath;
@@ -135,6 +154,12 @@ export function applySharerAccount(sharerAccount: { emailAddress: string; displa
     "additionalModelOptionsCache",
     "additionalModelCostsCache",
     "modelAccessCache",
+    // GrowthBook feature flags gate model availability (e.g. the fable
+    // off-switch / velvet-hammer flags). Cached for the receiver's OWN account,
+    // they can keep a model hidden/gated in /model even though the sharer's
+    // token has it — clear them so the gates re-fetch fresh over the proxy too.
+    "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt",
   ]) {
     delete config[k];
   }
@@ -261,6 +286,134 @@ export async function sessionPost(
   return r.json() as Promise<Record<string, unknown>>;
 }
 
+// ── Speed test ──────────────────────────────────────────────────────────────
+
+/**
+ * Download `bytes` from the sharer's /speedtest over one transport and return the
+ * measured throughput in Mbps (null on any failure). Uses node:https directly so
+ * it can count raw wire bytes (apiFetch decodes to a UTF-8 string) and pin the CA.
+ */
+function measureDownloadMbps(
+  baseUrl: string,
+  caPem: string,
+  proxyAuth: string,
+  bytes = 4_000_000,
+): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(`${baseUrl.replace(/\/$/, "")}/speedtest?bytes=${bytes}`);
+      const t0 = Date.now();
+      let total = 0;
+      const req = https.request(
+        {
+          hostname: u.hostname,
+          port: parseInt(u.port || "443", 10),
+          path: u.pathname + u.search,
+          method: "GET",
+          headers: { "Proxy-Authorization": proxyAuth },
+          ca: caPem,
+          rejectUnauthorized: true,
+          servername: u.hostname,
+        },
+        (res) => {
+          if ((res.statusCode ?? 0) !== 200) {
+            res.resume();
+            return resolve(null);
+          }
+          res.on("data", (chunk: Buffer) => {
+            total += chunk.length;
+          });
+          res.on("end", () => {
+            const secs = (Date.now() - t0) / 1000;
+            if (secs <= 0 || total <= 0) return resolve(null);
+            const mbps = (total * 8) / secs / 1_000_000;
+            resolve(Math.round(mbps * 10) / 10);
+          });
+          res.on("error", () => resolve(null));
+        },
+      );
+      req.setTimeout(20_000, () => req.destroy());
+      req.on("error", () => resolve(null));
+      req.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// ── Multi-account picker ────────────────────────────────────────────────────
+
+interface AccountOption {
+  id: string;
+  email: string | null;
+  plan: string | null;
+  usage: Array<{ key: string; pct: number; resetsAt: string | null }> | null;
+}
+
+function fmtUsageHint(usage: AccountOption["usage"]): string {
+  if (!usage || !usage.length) return "";
+  const label = (k: string) =>
+    k === "five_hour" ? "5h" : k === "seven_day" ? "week" : k.replace(/_/g, " ");
+  return usage.map((u) => `${label(u.key)} ${u.pct}%`).join(" · ");
+}
+
+// When the sharer exposes several Claude accounts, let the receiver pin this
+// launch to one of them (fixed for the whole session). A sharer without the
+// multi-account endpoint (or with a single account) is a no-op → default token.
+async function selectSharerAccount(
+  proxyUrl: string,
+  caPem: string,
+  proxyAuth: string,
+): Promise<void> {
+  let accounts: AccountOption[] = [];
+  let selected: string | null = null;
+  try {
+    const r = await apiFetch(`${proxyUrl}/accounts`, {
+      headers: { "Proxy-Authorization": proxyAuth },
+      timeout: 12_000,
+      ca: caPem,
+    });
+    if (!r.ok) return; // older sharer without /accounts → single default account
+    const data = (await r.json()) as {
+      accounts?: AccountOption[];
+      selected?: string | null;
+    };
+    accounts = data.accounts ?? [];
+    selected = data.selected ?? null;
+  } catch (err) {
+    logger.warn("[accounts] could not fetch account list", err);
+    return;
+  }
+  if (accounts.length <= 1) return; // nothing to choose
+
+  const pick = await p.select({
+    message: "Which shared account?",
+    initialValue: selected ?? accounts[0].id,
+    options: accounts.map((a) => ({
+      value: a.id,
+      label: a.email ?? a.id,
+      hint: [a.plan, fmtUsageHint(a.usage)].filter(Boolean).join(" · ") || undefined,
+    })),
+  });
+  if (p.isCancel(pick)) {
+    p.cancel("Cancelled.");
+    process.exit(0);
+  }
+  try {
+    await sessionPost(
+      proxyUrl,
+      "/session/select-account",
+      { accountId: pick as string },
+      caPem,
+      proxyAuth,
+    );
+    const chosen = accounts.find((a) => a.id === pick);
+    if (chosen) p.log.info(`Using account: ${chosen.email ?? chosen.id}`);
+  } catch (err) {
+    logger.warn("[accounts] select-account failed", err);
+  }
+}
+
 // ── Launch ────────────────────────────────────────────────────────────────────
 
 export async function launchClaude(
@@ -275,6 +428,9 @@ export async function launchClaude(
   claudeArgs: string[] = [],
   sharerAccount: SharerAccount | null = null,
   cwd?: string,
+  transport: string | null = null,
+  speedtestUrls: { bore?: string; cloudflare?: string } = {},
+  healProxy?: () => Promise<void>,
 ) {
   if (!(await checkClaudeInstalled())) {
     p.log.error("Claude Code is not installed or not in PATH.");
@@ -282,7 +438,23 @@ export async function launchClaude(
     process.exit(1);
   }
 
-  const connectSettingsPath = ensureConnectSettings(cwd);
+  // Stable proxy + CA-bundle path. Computed up front so they can be baked into
+  // the connect settings.json `env` (inherited by daemon-spawned resume/agent
+  // processes) as well as the direct spawn env below. The proxy URL and CA
+  // bundle path are both stable for the whole session.
+  const caBundlePath = path.join(os.homedir(), ".claude-share", "ca-bundle.pem");
+  const httpProxyUrl = buildProxyUrl(proxyUrl, meta.proxyUser, meta.proxyPass);
+  const proxyCaEnv: Record<string, string> = {
+    HTTPS_PROXY: httpProxyUrl,
+    HTTP_PROXY: httpProxyUrl,
+    NODE_EXTRA_CA_CERTS: caBundlePath,
+    SSL_CERT_FILE: caBundlePath,
+    REQUESTS_CA_BUNDLE: caBundlePath,
+    CURL_CA_BUNDLE: caBundlePath,
+    GIT_SSL_CAINFO: caBundlePath,
+  };
+
+  const connectSettingsPath = ensureConnectSettings(cwd, proxyCaEnv);
 
   // Ask permission mode before any side effects so the prompt is the first
   // thing after picking a server, not buried behind session setup.
@@ -305,9 +477,17 @@ export async function launchClaude(
   // still verify normal certs). Bun (Claude's runtime) treats this env var as
   // *replacing* the trust store rather than extending it, so a file with only
   // the MITM CA makes every non-Anthropic HTTPS fetch fail with an SSL error.
-  const tmpCert = path.join(os.tmpdir(), `claude-share-ca-${Date.now()}.pem`);
+  // Write the CA bundle to a STABLE path — NOT a per-launch temp file. A temp
+  // file gets deleted on this session's exit, but background agents / resumed
+  // sessions that outlive it (and Windows temp cleanup) then leave
+  // NODE_EXTRA_CA_CERTS pointing at a missing file → "load failed: No such file
+  // or directory" → the MITM cert is untrusted → every proxied request fails
+  // ("Unable to connect to API / ConnectionRefused"). A stable, never-deleted
+  // bundle is always present and safely shared across concurrent sessions.
+  // (caBundlePath is defined up top so it can also be baked into settings.json.)
   const caBundle = [caPem.trim(), ...tls.rootCertificates].join("\n") + "\n";
-  fs.writeFileSync(tmpCert, caBundle, { mode: 0o600 });
+  fs.mkdirSync(path.dirname(caBundlePath), { recursive: true });
+  fs.writeFileSync(caBundlePath, caBundle, { mode: 0o600 });
 
   const proxyAuth =
     "Basic " +
@@ -319,6 +499,10 @@ export async function launchClaude(
       `Session context: proxy=${new URL(proxyUrl).host} machineId=${meta.id}`,
     );
   } catch {}
+
+  // If the sharer exposes multiple accounts, pick one for this session before
+  // registering — the sharer bills this machine's requests to the chosen one.
+  await selectSharerAccount(proxyUrl, caPem, proxyAuth);
 
   // Register this Claude session with the sharer.
   // A 407 (stale proxyPass) or a TLS-cert mismatch (stale caPem / rotated CA)
@@ -333,16 +517,13 @@ export async function launchClaude(
         "re-shared, or revoked this device. Get a FRESH connect link and run:\n" +
         '  claude-connect --share "<new url>"',
     );
-    try {
-      fs.unlinkSync(tmpCert);
-    } catch {}
     process.exit(1);
   };
   try {
     const res = await sessionPost(
       proxyUrl,
       "/session/start",
-      { machineId: meta.id },
+      transport ? { machineId: meta.id, transport } : { machineId: meta.id },
       caPem,
       proxyAuth,
     );
@@ -364,6 +545,36 @@ export async function launchClaude(
       abortStale("TLS certificate mismatch — the sharer's proxy identity changed since you paired.");
     }
     logger.error("[leg: receiver→bore→sharer] session/start failed", err);
+  }
+
+  // Benchmark download throughput over each available transport (bore vs
+  // Cloudflare) and report it so the dashboard can compare bore vs tunnel.
+  // Fire-and-forget — must never delay or block the Claude launch.
+  if (sessionId && (speedtestUrls.bore || speedtestUrls.cloudflare)) {
+    void (async () => {
+      const [boreMbps, cloudflareMbps] = await Promise.all([
+        speedtestUrls.bore
+          ? measureDownloadMbps(speedtestUrls.bore, caPem, proxyAuth)
+          : Promise.resolve(null),
+        speedtestUrls.cloudflare
+          ? measureDownloadMbps(speedtestUrls.cloudflare, caPem, proxyAuth)
+          : Promise.resolve(null),
+      ]);
+      logger.info(
+        `[speedtest] bore=${boreMbps ?? "n/a"} cloudflare=${cloudflareMbps ?? "n/a"} Mbps`,
+      );
+      await sessionPost(
+        proxyUrl,
+        "/session/speedtest",
+        {
+          machineId: meta.id,
+          boreMbps: String(boreMbps),
+          cloudflareMbps: String(cloudflareMbps),
+        },
+        caPem,
+        proxyAuth,
+      ).catch(() => {});
+    })();
   }
 
   // 30-second heartbeat so sharer sees lastActiveAt update. A broken tunnel
@@ -409,6 +620,7 @@ export async function launchClaude(
   //                 (sharer ↔ Anthropic). Look at the sharer dashboard "Errors"
   //                 tab / logs at the same timestamp for the real status/reason.
   let netReachable: boolean | null = null;
+  let healing = false;
   const netMonitor = setInterval(() => {
     void apiFetch(`${proxyUrl}/health`, { timeout: 6000, ca: caPem })
       .then(() => {
@@ -427,6 +639,18 @@ export async function launchClaude(
               `Claude's "check your network"/Retrying errors are a CLIENT-side tunnel problem (this machine's network/VPN, or bore/the share is offline), not the sharer's account`,
           );
         }
+        // A Cloudflare share's local bridge may have dropped — re-ensure it on its
+        // pinned port (no-op if healthy) so HTTPS_PROXY stays valid and Claude
+        // reconnects on its own instead of retrying a dead proxy forever.
+        if (healProxy && !healing) {
+          healing = true;
+          void healProxy()
+            .then(() => logger.info("[net] cloudflare bridge re-ensured after drop"))
+            .catch(() => {})
+            .finally(() => {
+              healing = false;
+            });
+        }
       });
   }, 15_000);
   netMonitor.unref?.();
@@ -436,8 +660,6 @@ export async function launchClaude(
   p.outro("");
 
   const startTime = Date.now();
-
-  const httpProxyUrl = buildProxyUrl(proxyUrl, meta.proxyUser, meta.proxyPass);
 
   // On Windows we spawn through the shell (so `claude`/`claude.cmd` resolves),
   // but cmd.exe then splits unquoted args on spaces — so a home dir like
@@ -460,17 +682,17 @@ export async function launchClaude(
       ...process.env,
       HTTPS_PROXY: httpProxyUrl,
       HTTP_PROXY: httpProxyUrl,
-      NODE_EXTRA_CA_CERTS: tmpCert,
+      NODE_EXTRA_CA_CERTS: caBundlePath,
       // Claude's child processes (MCP servers, and the tools THEY spawn — uv,
       // pip, curl, git…) inherit HTTPS_PROXY and so tunnel through the MITM
       // proxy, but non-Node tools don't read NODE_EXTRA_CA_CERTS, so they reject
       // the proxy's self-signed cert ("invalid peer certificate / tunnel error /
       // can't auth"). Point their CA-bundle env vars at the same bundle (MITM CA
       // + real roots) so they trust the proxy AND still validate real sites.
-      SSL_CERT_FILE: tmpCert,
-      REQUESTS_CA_BUNDLE: tmpCert,
-      CURL_CA_BUNDLE: tmpCert,
-      GIT_SSL_CAINFO: tmpCert,
+      SSL_CERT_FILE: caBundlePath,
+      REQUESTS_CA_BUNDLE: caBundlePath,
+      CURL_CA_BUNDLE: caBundlePath,
+      GIT_SSL_CAINFO: caBundlePath,
     },
   });
 
@@ -500,9 +722,6 @@ export async function launchClaude(
         proxyAuth,
       ).catch(() => {});
     }
-    try {
-      fs.unlinkSync(tmpCert);
-    } catch {}
     const durationMs = Date.now() - startTime;
     const duration = Math.floor(durationMs / 1000);
     const mins = Math.floor(duration / 60);
@@ -551,9 +770,6 @@ export async function launchClaude(
         proxyAuth,
       ).catch(() => {});
     }
-    try {
-      fs.unlinkSync(tmpCert);
-    } catch {}
     process.exit(1);
   });
 

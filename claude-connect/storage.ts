@@ -177,3 +177,20 @@ export function findConnectionByServerUrl(
     (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime(),
   )[0];
 }
+
+/**
+ * A Cloudflare share is identified by its tunnel hostname, not its
+ * publicServerUrl (which is the bore path and identical across accounts).
+ * Returns the most recently saved connection paired via this hostname.
+ */
+export function findConnectionByCloudflareHost(
+  hostname: string,
+): SavedConnection | null {
+  const all = loadConnections().filter(
+    (c) => c.cloudflare?.hostname === hostname,
+  );
+  if (all.length === 0) return null;
+  return all.sort(
+    (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime(),
+  )[0];
+}

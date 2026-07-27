@@ -30,6 +30,9 @@ export interface Machine {
   pairedAt: Date;
   sessions: Map<string, MachineSession>;
   proxyPass: string;
+  /** Which sharer account (by id) this machine's requests are billed to. Null =
+   * default account. Fixed at launch by the receiver's account picker. */
+  selectedAccount: string | null;
   stats: {
     inputTokens: number;
     outputTokens: number;
@@ -37,6 +40,16 @@ export interface Machine {
     cacheWriteTokens: number;
     requests: number;
   };
+  /** Transport the receiver reported at launch ("bore" | "cloudflare"). In-memory
+   * only — the sharer can't infer it (both arrive on the same local port). */
+  transport?: string | null;
+  /** Latest receiver-run download benchmark over each transport, in Mbps.
+   * In-memory only; re-reported whenever the receiver reconnects. */
+  speedtest?: {
+    boreMbps: number | null;
+    cloudflareMbps: number | null;
+    at: string;
+  } | null;
 }
 
 export type { ConnectionFile, SharerAccount } from "@shared/types";
@@ -126,6 +139,7 @@ export function addMachine(session: Session, name: string): Machine {
     pairedAt: new Date(),
     sessions: new Map(),
     proxyPass: Buffer.from(randomBytes(16)).toString("hex"),
+    selectedAccount: null,
     stats: {
       inputTokens: 0,
       outputTokens: 0,
@@ -149,6 +163,41 @@ export function removeMachine(session: Session, machineId: string): boolean {
   const removed = session.machines.delete(machineId);
   if (removed && session.machines.size === 0) session.status = "waiting";
   return removed;
+}
+
+/** Sets which sharer account a machine's requests are billed to. Fixed at launch. */
+export function setMachineAccount(
+  session: Session,
+  machineId: string,
+  accountId: string | null,
+): boolean {
+  const machine = session.machines.get(machineId);
+  if (!machine) return false;
+  machine.selectedAccount = accountId;
+  saveSession(session);
+  return true;
+}
+
+/** Records which transport ("bore"|"cloudflare") the receiver used, for the
+ * dashboard. In-memory only (not persisted). */
+export function setMachineTransport(
+  session: Session,
+  machineId: string,
+  transport: string | null,
+): void {
+  const machine = session.machines.get(machineId);
+  if (machine) machine.transport = transport;
+}
+
+/** Records the receiver's measured bore-vs-cloudflare download benchmark.
+ * In-memory only (not persisted). */
+export function setMachineSpeedtest(
+  session: Session,
+  machineId: string,
+  result: { boreMbps: number | null; cloudflareMbps: number | null },
+): void {
+  const machine = session.machines.get(machineId);
+  if (machine) machine.speedtest = { ...result, at: new Date().toISOString() };
 }
 
 /** Returns true if the Proxy-Authorization header matches any active machine. */
@@ -256,6 +305,7 @@ export function saveSession(session: Session): void {
         name: m.name,
         pairedAt: m.pairedAt.toISOString(),
         proxyPass: m.proxyPass,
+        selectedAccount: m.selectedAccount,
         stats: m.stats,
       })),
     };
@@ -271,7 +321,7 @@ export function loadSession(): Session | null {
 
     const key = Uint8Array.from(Buffer.from(raw.key, "hex"));
     const machines = new Map<string, Machine>(
-      (raw.machines ?? []).map((m: { id: string; name: string; pairedAt: string; proxyPass: string; stats?: any }) => [
+      (raw.machines ?? []).map((m: { id: string; name: string; pairedAt: string; proxyPass: string; selectedAccount?: string | null; stats?: any }) => [
         m.id,
         {
           id: m.id,
@@ -279,6 +329,7 @@ export function loadSession(): Session | null {
           pairedAt: new Date(m.pairedAt),
           sessions: new Map(),
           proxyPass: m.proxyPass,
+          selectedAccount: m.selectedAccount ?? null,
           stats: m.stats ?? {
             inputTokens: 0,
             outputTokens: 0,

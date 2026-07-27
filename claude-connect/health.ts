@@ -57,6 +57,19 @@ async function checkHealth(
     clearTimeout(timeoutId);
   }
 }
+
+/**
+ * Health-probe an already-resolved dial URL directly (e.g. a Cloudflare bridge's
+ * localhost port), instead of re-deriving it from conn.publicServerUrl the way
+ * resolveActiveUrl does — used to decide resume-vs-repair for a Cloudflare share.
+ */
+export async function probeUrl(
+  url: string,
+  caPem?: string,
+  timeout = 8000,
+): Promise<HealthResult> {
+  return checkHealth(url, caPem, timeout);
+}
 /**
  * @description Takes the connection file to figure out the
  *  fastest route (LAN or Public URL) to reach server.

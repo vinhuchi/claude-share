@@ -22,6 +22,8 @@ Build: `bun run build` (compiles both via bun build). Lint: `bun run lint`.
 
 **Token injection**: sharer's OAuth token is read from macOS Keychain at startup and injected per-request inside the MITM. Never written to disk, never sent to receiver.
 
+**Multi-account** (`proxy/token.ts`): set `CLAUDE_ACCOUNTS=<dir1>,<dir2>,…` (comma-separated `CLAUDE_CONFIG_DIR`s, e.g. `~/.claude,~/.claude-acc2`) to expose several accounts; unset = single default account (`~/.claude`/Keychain), unchanged. Each account's creds come from `<dir>/.credentials.json` (default falls back to the platform store), refreshed via `CLAUDE_CONFIG_DIR=<dir> claude -p HI`. The receiver picks one at launch (`GET /accounts` → picker → `POST /session/select-account`); the choice is stored per-machine as `machine.selectedAccount` and the MITM injects that account's token. Fixed for the whole session (no mid-session switch).
+
 **Pairing**: connect URL format is `http://<host>/connect/<pairingCode>`. The pairingCode is `base58(32-byte session key)` — it's also the private decryption key. Only the first 5 chars are sent over HTTP for session lookup; the receiver decrypts the response blob locally using the full key from the URL.
 
 **Session key lifecycle**: `session.key` (32 bytes) → `session.pairingCode` (base58). Pressing `n` in TUI calls `regeneratePairingCode()` which zeroes nothing but replaces key+code and clears `pairingAttempts`. `destroySession()` zeroes the key.

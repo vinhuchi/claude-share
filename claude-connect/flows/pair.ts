@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
 
+import { getOrCreateBridge } from "../cloudflared";
 import { apiFetch } from "../fetch";
 import { launchClaude } from "../launch";
 import { logger } from "../logger";
@@ -9,7 +10,11 @@ import {
   writeActiveConnection,
   writeConnection,
 } from "../storage";
-import type { ConnectionFile, SavedConnection } from "../types";
+import type {
+  CloudflareTunnelInfo,
+  ConnectionFile,
+  SavedConnection,
+} from "../types";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -19,7 +24,11 @@ const UUID_RE =
 const PAIRING_LOOKUP_PREFIX_LEN = 5;
 
 export async function pairFlow(
-  prefill?: { serverUrl: string; pairingCode: string },
+  prefill?: {
+    serverUrl: string;
+    pairingCode: string;
+    cloudflare?: CloudflareTunnelInfo;
+  },
   claudeArgs: string[] = [],
   cwd?: string,
 ) {
@@ -27,10 +36,12 @@ export async function pairFlow(
 
   let serverUrl: string;
   let pairingCode: string;
+  let cloudflare: CloudflareTunnelInfo | undefined;
 
   if (prefill) {
     serverUrl = prefill.serverUrl;
     pairingCode = prefill.pairingCode;
+    cloudflare = prefill.cloudflare;
     p.log.info(`Connecting to ${serverUrl}`);
   } else {
     const input = await p.text({
@@ -50,6 +61,7 @@ export async function pairFlow(
     if (parsed) {
       serverUrl = parsed.serverUrl;
       pairingCode = parsed.pairingCode;
+      cloudflare = parsed.cloudflare;
     } else {
       serverUrl = (input as string).trim();
       const codeInput = await p.text({
@@ -72,6 +84,28 @@ export async function pairFlow(
     process.exit(1);
   }
 
+  // Cloudflare Tunnel: the sharer's hostname is a tcp:// ingress that can't be
+  // dialed directly — open a local `cloudflared access tcp` bridge and talk to
+  // that localhost port for BOTH pairing and the Claude session. The sharer's
+  // cert already SANs `localhost`, so the pinned TLS check still passes.
+  let dialUrl = serverUrl;
+  if (cloudflare) {
+    const cfSpin = p.spinner();
+    cfSpin.start("Opening Cloudflare tunnel bridge…");
+    try {
+      dialUrl = await getOrCreateBridge(
+        cloudflare.hostname,
+        cloudflare.serviceTokenId,
+        cloudflare.serviceTokenSecret,
+      );
+      cfSpin.stop(`Cloudflare bridge ready (${cloudflare.hostname}).`);
+    } catch (err) {
+      cfSpin.stop("Failed.");
+      p.log.error(`Cloudflare bridge failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
   const name = getDeviceName();
   p.log.info(`Connecting as "${name}"`);
 
@@ -83,7 +117,7 @@ export async function pairFlow(
   try {
     // rejectUnauthorized: false is safe here — the /pair response is E2E encrypted
     // with the pairingCode as the key, so a MITM cannot read or forge a valid response.
-    const res = await apiFetch(`${serverUrl}/pair`, {
+    const res = await apiFetch(`${dialUrl}/pair`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -146,13 +180,16 @@ export async function pairFlow(
     sharerAccount: file.sharerAccount ?? null,
     proxyUser: file.proxyUser,
     proxyPass: file.proxyPass,
+    cloudflare: cloudflare ?? null,
   };
   writeConnection(saved);
 
   // Use the best available route for both the VS Code extension's
   // active-connection.json and the launched Claude proxy/session, matching
-  // reconnect's "best route" semantics.
-  const bestUrl = file.publicServerUrl ?? serverUrl;
+  // reconnect's "best route" semantics. For a Cloudflare share we MUST keep
+  // dialing the local bridge (the sharer's publicServerUrl is the bore path,
+  // which may be exactly what's blocked/unreachable here).
+  const bestUrl = cloudflare ? dialUrl : file.publicServerUrl ?? serverUrl;
   writeActiveConnection(saved, bestUrl);
 
   await launchClaude(
@@ -162,5 +199,18 @@ export async function pairFlow(
     claudeArgs,
     file.sharerAccount ?? null,
     cwd,
+    cloudflare ? "cloudflare" : "bore",
+    {
+      bore: file.publicServerUrl ?? undefined,
+      cloudflare: cloudflare ? dialUrl : undefined,
+    },
+    cloudflare
+      ? () =>
+          getOrCreateBridge(
+            cloudflare!.hostname,
+            cloudflare!.serviceTokenId,
+            cloudflare!.serviceTokenSecret,
+          ).then(() => {})
+      : undefined,
   );
 }

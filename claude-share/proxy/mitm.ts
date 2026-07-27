@@ -17,6 +17,7 @@ import { recordUsageEvent } from "./usageLog";
 import { isRecording, isIncludingMessages, saveFlow } from "./flowLog";
 import { getAccessToken, getFreshAccessToken } from "./token";
 import { resolveMachineId } from "../session/manager";
+import { recordBytes } from "./bytesCounter";
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
@@ -169,6 +170,31 @@ function pruneErrorLogs(logDir: string, keep = 300): void {
       } catch {}
     }
   } catch {}
+}
+
+// Sample a tunnel socket's cumulative wire bytes into the per-machine counters.
+// One CONNECT tunnel carries a keep-alive stream that stays open for the whole
+// session, so poll on an interval (not just on close) to keep the dashboard's
+// live up/down speed current, with a final sample on close for the last delta.
+// bytesRead = uploads from the client, bytesWritten = downloads to it.
+function trackSocketBytes(socket: net.Socket, machineId: string): void {
+  let lastRead = 0;
+  let lastWritten = 0;
+  const sample = () => {
+    const r = socket.bytesRead;
+    const w = socket.bytesWritten;
+    const dr = r - lastRead;
+    const dw = w - lastWritten;
+    if (dr > 0 || dw > 0) recordBytes(machineId, dr, dw);
+    lastRead = r;
+    lastWritten = w;
+  };
+  const iv = setInterval(sample, 2000);
+  iv.unref?.();
+  socket.once("close", () => {
+    sample();
+    clearInterval(iv);
+  });
 }
 
 export interface MitmProxy {
@@ -450,6 +476,13 @@ export async function createMitmProxy(
         ctx[CTX_MACHINE_ID] = machineId;
       }
 
+      // Multi-account: this machine's requests are billed to the account it chose
+      // at launch (null → default account). Resolved per-request so a mid-session
+      // token rotation on that account is always picked up.
+      const accountId = machineId
+        ? getSession?.()?.machines.get(machineId)?.selectedAccount ?? undefined
+        : undefined;
+
       ctx[CTX_LOG_ID] = logRequest(method, hostname, reqPath, "allowed", machineId);
 
       ctx.proxyToServerRequestOptions.headers =
@@ -458,13 +491,13 @@ export async function createMitmProxy(
       // Re-read the on-disk token if the cached snapshot is stale, so we never
       // forward a token the sharer's CLI has already rotated out. Header rewrites,
       // body redaction and callback() run in finally regardless of the outcome.
-      getFreshAccessToken()
+      getFreshAccessToken(accountId)
         .then((token) => {
           ctx.proxyToServerRequestOptions.headers["authorization"] = `Bearer ${token}`;
         })
         .catch((err) => {
           logger.error("[mitm] fresh token fetch failed, using cached token", err);
-          ctx.proxyToServerRequestOptions.headers["authorization"] = `Bearer ${getAccessToken()}`;
+          ctx.proxyToServerRequestOptions.headers["authorization"] = `Bearer ${getAccessToken(accountId)}`;
         })
         .finally(() => {
           delete ctx.proxyToServerRequestOptions.headers["x-api-key"];
@@ -775,11 +808,15 @@ export async function createMitmProxy(
           return;
         }
 
-        // Resolve and store machineId for this tunnel
+        // Resolve and store machineId for this tunnel, and start byte accounting
+        // so the dashboard can show per-client upload/download + live speed.
         const session = getSession?.();
         if (session) {
           const mid = resolveMachineId(session, connectAuth);
-          if (mid) socketMachineId.set(socket, mid);
+          if (mid) {
+            socketMachineId.set(socket, mid);
+            trackSocketBytes(socket, mid);
+          }
         }
 
         const [hostname, portStr] = ((req.url as string) ?? "").split(":");
