@@ -43,13 +43,6 @@ export interface Machine {
   /** Transport the receiver reported at launch ("bore" | "cloudflare"). In-memory
    * only — the sharer can't infer it (both arrive on the same local port). */
   transport?: string | null;
-  /** Latest receiver-run download benchmark over each transport, in Mbps.
-   * In-memory only; re-reported whenever the receiver reconnects. */
-  speedtest?: {
-    boreMbps: number | null;
-    cloudflareMbps: number | null;
-    at: string;
-  } | null;
 }
 
 export type { ConnectionFile, SharerAccount } from "@shared/types";
@@ -187,17 +180,6 @@ export function setMachineTransport(
 ): void {
   const machine = session.machines.get(machineId);
   if (machine) machine.transport = transport;
-}
-
-/** Records the receiver's measured bore-vs-cloudflare download benchmark.
- * In-memory only (not persisted). */
-export function setMachineSpeedtest(
-  session: Session,
-  machineId: string,
-  result: { boreMbps: number | null; cloudflareMbps: number | null },
-): void {
-  const machine = session.machines.get(machineId);
-  if (machine) machine.speedtest = { ...result, at: new Date().toISOString() };
 }
 
 /** Returns true if the Proxy-Authorization header matches any active machine. */

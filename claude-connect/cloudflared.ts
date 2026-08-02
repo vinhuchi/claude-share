@@ -170,7 +170,7 @@ export async function startAccessTcp(
     "--hostname",
     hostname,
     "--url",
-    `localhost:${localPort}`,
+    `127.0.0.1:${localPort}`,
   ];
   if (serviceTokenId && serviceTokenSecret) {
     args.push(
@@ -311,7 +311,7 @@ export async function getOrCreateBridge(
 
     // Healthy shared bridge already up → reuse.
     if (lock && sameHost && pidAlive(lock.pid) && (await isPortListening(lock.port))) {
-      return `https://localhost:${lock.port}`;
+      return `https://127.0.0.1:${lock.port}`;
     }
 
     // Dead/hung bridge for this host: reap the old process so its port frees up,
@@ -328,7 +328,7 @@ export async function getOrCreateBridge(
     const bin = (await getCloudflaredPath()) ?? "cloudflared";
     const port = lock && sameHost && lock.port ? lock.port : await freePort();
 
-    const args = ["access", "tcp", "--hostname", hostname, "--url", `localhost:${port}`];
+    const args = ["access", "tcp", "--hostname", hostname, "--url", `127.0.0.1:${port}`];
     if (serviceTokenId && serviceTokenSecret) {
       args.push("--service-token-id", serviceTokenId, "--service-token-secret", serviceTokenSecret);
     }
@@ -367,7 +367,7 @@ export async function getOrCreateBridge(
       } catch {}
       throw err;
     }
-    return `https://localhost:${port}`;
+    return `https://127.0.0.1:${port}`;
   })();
 
   try {

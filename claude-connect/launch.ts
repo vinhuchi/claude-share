@@ -3,7 +3,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import https from "node:https";
 import { promisify } from "node:util";
 
 import * as p from "@clack/prompts";
@@ -286,61 +285,6 @@ export async function sessionPost(
   return r.json() as Promise<Record<string, unknown>>;
 }
 
-// ── Speed test ──────────────────────────────────────────────────────────────
-
-/**
- * Download `bytes` from the sharer's /speedtest over one transport and return the
- * measured throughput in Mbps (null on any failure). Uses node:https directly so
- * it can count raw wire bytes (apiFetch decodes to a UTF-8 string) and pin the CA.
- */
-function measureDownloadMbps(
-  baseUrl: string,
-  caPem: string,
-  proxyAuth: string,
-  bytes = 4_000_000,
-): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      const u = new URL(`${baseUrl.replace(/\/$/, "")}/speedtest?bytes=${bytes}`);
-      const t0 = Date.now();
-      let total = 0;
-      const req = https.request(
-        {
-          hostname: u.hostname,
-          port: parseInt(u.port || "443", 10),
-          path: u.pathname + u.search,
-          method: "GET",
-          headers: { "Proxy-Authorization": proxyAuth },
-          ca: caPem,
-          rejectUnauthorized: true,
-          servername: u.hostname,
-        },
-        (res) => {
-          if ((res.statusCode ?? 0) !== 200) {
-            res.resume();
-            return resolve(null);
-          }
-          res.on("data", (chunk: Buffer) => {
-            total += chunk.length;
-          });
-          res.on("end", () => {
-            const secs = (Date.now() - t0) / 1000;
-            if (secs <= 0 || total <= 0) return resolve(null);
-            const mbps = (total * 8) / secs / 1_000_000;
-            resolve(Math.round(mbps * 10) / 10);
-          });
-          res.on("error", () => resolve(null));
-        },
-      );
-      req.setTimeout(20_000, () => req.destroy());
-      req.on("error", () => resolve(null));
-      req.end();
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
 // ── Multi-account picker ────────────────────────────────────────────────────
 
 interface AccountOption {
@@ -429,7 +373,6 @@ export async function launchClaude(
   sharerAccount: SharerAccount | null = null,
   cwd?: string,
   transport: string | null = null,
-  speedtestUrls: { bore?: string; cloudflare?: string } = {},
   healProxy?: () => Promise<void>,
 ) {
   if (!(await checkClaudeInstalled())) {
@@ -545,36 +488,6 @@ export async function launchClaude(
       abortStale("TLS certificate mismatch — the sharer's proxy identity changed since you paired.");
     }
     logger.error("[leg: receiver→bore→sharer] session/start failed", err);
-  }
-
-  // Benchmark download throughput over each available transport (bore vs
-  // Cloudflare) and report it so the dashboard can compare bore vs tunnel.
-  // Fire-and-forget — must never delay or block the Claude launch.
-  if (sessionId && (speedtestUrls.bore || speedtestUrls.cloudflare)) {
-    void (async () => {
-      const [boreMbps, cloudflareMbps] = await Promise.all([
-        speedtestUrls.bore
-          ? measureDownloadMbps(speedtestUrls.bore, caPem, proxyAuth)
-          : Promise.resolve(null),
-        speedtestUrls.cloudflare
-          ? measureDownloadMbps(speedtestUrls.cloudflare, caPem, proxyAuth)
-          : Promise.resolve(null),
-      ]);
-      logger.info(
-        `[speedtest] bore=${boreMbps ?? "n/a"} cloudflare=${cloudflareMbps ?? "n/a"} Mbps`,
-      );
-      await sessionPost(
-        proxyUrl,
-        "/session/speedtest",
-        {
-          machineId: meta.id,
-          boreMbps: String(boreMbps),
-          cloudflareMbps: String(cloudflareMbps),
-        },
-        caPem,
-        proxyAuth,
-      ).catch(() => {});
-    })();
   }
 
   // 30-second heartbeat so sharer sees lastActiveAt update. A broken tunnel

@@ -194,7 +194,6 @@ if (args.includes("--serve")) {
           existingCf.sharerAccount ?? null,
           dirArg,
           "cloudflare",
-          { bore: existingCf.publicServerUrl ?? undefined, cloudflare: dialUrl },
           cfHeal(parsed.cloudflare),
         );
       }
@@ -216,7 +215,6 @@ if (args.includes("--serve")) {
           existing.sharerAccount ?? null,
           dirArg,
           "bore",
-          { bore: resolved.url },
         );
       } else {
         // Session changed, server restarted, or TLS cert rotated (sharer restart
@@ -306,9 +304,6 @@ if (args.includes("--serve")) {
           chosen.conn.sharerAccount ?? null,
           dirArg,
           chosen.conn.cloudflare ? "cloudflare" : "bore",
-          chosen.conn.cloudflare
-            ? { bore: chosen.conn.publicServerUrl ?? undefined, cloudflare: dialUrl }
-            : { bore: chosen.url },
           chosen.conn.cloudflare ? cfHeal(chosen.conn.cloudflare) : undefined,
         );
       }

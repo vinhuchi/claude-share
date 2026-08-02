@@ -20,7 +20,6 @@ import {
   resolveMachineId,
   setMachineAccount,
   setMachineTransport,
-  setMachineSpeedtest,
   setSessionUnlimited,
   type ConnectionFile,
   type SharerAccount,
@@ -195,45 +194,6 @@ export function createApiApp(
     if (!ms) return c.json({ error: "Machine not found" }, 404);
     if (transport) setMachineTransport(session, machineId, transport);
     return c.json({ ok: true, sessionId: ms.id });
-  });
-
-  /**
-   * GET /speedtest?bytes=N — returns N bytes of filler so the receiver can
-   * benchmark download throughput over each transport (bore vs Cloudflare) and
-   * report the result. Proxy-authed by the global middleware; size is capped so
-   * it can't be used to burn bandwidth.
-   */
-  app.get("/speedtest", (c) => {
-    const requested = parseInt(c.req.query("bytes") ?? "3000000", 10) || 0;
-    const n = Math.min(Math.max(requested, 0), 25_000_000);
-    return c.body(Buffer.alloc(n), 200, {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": String(n),
-      "Cache-Control": "no-store",
-    });
-  });
-
-  /**
-   * POST /session/speedtest {boreMbps, cloudflareMbps} — the receiver reports the
-   * download throughput it measured over each transport. Proxy-authed; a machine
-   * is resolved from its own auth so it can only report for itself.
-   */
-  app.post("/session/speedtest", async (c) => {
-    const session = getSession();
-    if (!session) return c.json({ error: "No active session" }, 503);
-    const auth = c.req.header("proxy-authorization") ?? "";
-    const mid = resolveMachineId(session, auth);
-    if (!mid) return c.json({ error: "Machine not found" }, 404);
-    const body = await c.req.json<{ boreMbps?: unknown; cloudflareMbps?: unknown }>();
-    const num = (v: unknown): number | null => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-    setMachineSpeedtest(session, mid, {
-      boreMbps: num(body.boreMbps),
-      cloudflareMbps: num(body.cloudflareMbps),
-    });
-    return c.json({ ok: true });
   });
 
   /** POST /session/end — receiver closed a Claude session */
@@ -805,10 +765,6 @@ export function createApiApp(
             return fmtBytes(bytesPerSec) + '/s';
         }
 
-        function fmtMbps(v) {
-            return (v === null || v === undefined) ? '—' : v.toFixed(1) + ' Mbps';
-        }
-
         function transportBadge(t) {
             if (t === 'cloudflare') return '<span class="px-2 py-0.5 text-xs font-semibold rounded bg-orange-950/30 text-orange-400">cloudflare</span>';
             if (t === 'bore') return '<span class="px-2 py-0.5 text-xs font-semibold rounded bg-sky-950/30 text-sky-400">bore</span>';
@@ -1040,7 +996,6 @@ export function createApiApp(
                             '</td>' +
                             '<td class="py-3 px-4 text-sm whitespace-nowrap">' +
                             transportBadge(m.transport) +
-                            (m.speedtest ? '<br/><span class="text-zinc-500 text-xs">bore ' + fmtMbps(m.speedtest.boreMbps) + ' · cf ' + fmtMbps(m.speedtest.cloudflareMbps) + '</span>' : '') +
                             '</td>' +
                             '<td class="py-3 px-4 text-right">' +
                             '<button onclick="revokeMachine(' + "'" + m.id + "'" + ')" class="px-2.5 py-1 text-xs font-semibold text-red-400 border border-red-950/30 bg-red-950/10 hover:bg-red-950/30 hover:text-red-300 rounded transition">Revoke</button>' +
@@ -1444,7 +1399,6 @@ export function createApiApp(
         bytesUp: bytes.up,
         bytesDown: bytes.down,
         transport: m.transport ?? null,
-        speedtest: m.speedtest ?? null,
         sessions: [...m.sessions.values()].map((s) => ({
           id: s.id,
           startedAt: s.startedAt.toISOString(),

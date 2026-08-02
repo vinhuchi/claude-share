@@ -200,10 +200,6 @@ export async function pairFlow(
     file.sharerAccount ?? null,
     cwd,
     cloudflare ? "cloudflare" : "bore",
-    {
-      bore: file.publicServerUrl ?? undefined,
-      cloudflare: cloudflare ? dialUrl : undefined,
-    },
     cloudflare
       ? () =>
           getOrCreateBridge(

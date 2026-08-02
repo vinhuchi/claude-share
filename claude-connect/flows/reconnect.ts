@@ -62,6 +62,5 @@ export async function reconnectFlow(
     chosen.sharerAccount ?? null,
     cwd,
     "bore",
-    { bore: resolvedUrl },
   );
 }
